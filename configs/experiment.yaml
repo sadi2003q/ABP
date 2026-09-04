@@ -1,0 +1,19 @@
+# =============================================================================
+# Experiment Configuration
+# =============================================================================
+
+experiment:
+
+  name: baseline
+
+  description: Initial self-supervised dynamic object detection baseline
+
+  output_dir: outputs
+
+  checkpoint_dir: checkpoints
+
+  log_dir: logs
+
+  save_predictions: true
+
+  save_visualizations: true

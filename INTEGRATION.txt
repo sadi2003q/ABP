@@ -1,0 +1,321 @@
+============================================================
+INTEGRATION GUIDE
+EventCameraProject — Patch Set 1 + Patch Set 2
+============================================================
+
+This guide explains how to integrate the two patch sets
+into your existing project.
+
+------------------------------------------------------------
+WHAT YOU'RE GETTING
+------------------------------------------------------------
+
+Two patch sets in this zip:
+
+Patch Set 1 (5 fixes from earlier conversation):
+  - src/losses/dynamic_residual_loss.py        (NEW)
+  - src/losses/dynamic_mask_regularization_loss.py
+  - src/losses/total_loss.py
+  - src/models/world_model/model.py
+  - src/models/world_model/temporal_memory.py
+  - CHANGES.md (Patch Set 1 explanation)
+
+Patch Set 2 (U-Net skip connections):
+  - src/models/world_model/decoder.py
+  - src/models/world_model/model.py (updated)
+  - CHANGES_PATCH2.md (Patch Set 2 explanation)
+
+Both patch sets are mutually compatible. Apply Patch Set 1 first,
+then Patch Set 2 (Patch Set 2's model.py supersedes Patch Set 1's
+model.py — it contains BOTH sets of changes).
+
+------------------------------------------------------------
+STEP-BY-STEP INTEGRATION
+------------------------------------------------------------
+
+PREREQUISITES
+-------------
+- Your repo has the structure described in README.md (src/,
+  configs/, notebooks/, etc.)
+- You have a working Python 3.10+ environment with PyTorch 2.x
+  installed
+- You have NOT yet started training (no saved checkpoints to
+  worry about — see "Saved Checkpoints" below if you have any)
+
+
+STEP 1 — Back up your current code
+-----------------------------------
+Before applying any patches, make a backup:
+
+    cd ~/git/EventCameraProject
+    git add -A
+    git commit -m "Backup before patch set 1+2"
+    # OR if you don't use git:
+    cp -r src src_backup_$(date +%Y%m%d)
+
+
+STEP 2 — Extract the zip into your repo root
+---------------------------------------------
+The zip preserves the repo-relative paths. Just extract it
+from your repo root:
+
+    cd ~/git/EventCameraProject
+    unzip /path/to/pipeline_patches_with_unet.zip
+
+This will OVERWRITE the following files:
+  src/losses/dynamic_mask_regularization_loss.py
+  src/losses/total_loss.py
+  src/models/world_model/model.py
+  src/models/world_model/temporal_memory.py
+  src/models/world_model/decoder.py
+
+And CREATE this new file:
+  src/losses/dynamic_residual_loss.py
+
+And DROP these docs into your repo root:
+  CHANGES.md              (Patch Set 1 explanation)
+  CHANGES_PATCH2.md       (Patch Set 2 explanation)
+  INTEGRATION.txt         (this file)
+  verify_patches.py       (Patch Set 1 verification script)
+  compatibility_test.py  (Patch Set 2 full integration test,
+                           modeled on notebooks/12_full_model_test.ipynb)
+
+
+STEP 3 — Verify the patches applied correctly
+----------------------------------------------
+Run the small smoke test (Patch Set 1 verification):
+
+    python verify_patches.py
+
+Expected output: 9/9 checks pass. Look for:
+  [PASS] fix_target_leakage
+  [PASS] fix_target_detach
+  [PASS] fix_rho_default
+  [PASS] fix_dynamic_ratio_weight
+  [PASS] fix_K_scale
+  [PASS] fix_residual_loss
+  [PASS] fix_resolution_mismatch
+  [PASS] fix_positional_encoding
+  [PASS] integration
+
+
+STEP 4 — Run the full compatibility test
+-----------------------------------------
+This test mirrors notebooks/12_full_model_test.ipynb — it uses
+synthetic data with the same shapes (B=2, T=4, H=480, W=640,
+num_bins=5) and verifies all output shapes, gradients, and a
+3-step training loop.
+
+    python compatibility_test.py
+
+Expected output: 10/10 checks pass. Look for:
+
+  ✓ WORLD MODEL INTEGRATION TEST PASSED
+
+The test is split into two phases:
+  Phase 1 (480x640): forward pass + shape verification only
+                     (mirrors notebook 12 cell 9 assertions)
+  Phase 2 (128x160): gradient + training step tests
+                     (smaller resolution to avoid OOM on CPU;
+                      same code paths exercised)
+
+If you have a GPU with >=12GB VRAM, you can run Phase 2 at
+480x640 by editing compatibility_test.py:
+  - Find "B_s, T_s, H_s, W_s = 2, 4, 128, 160"
+  - Change to "B_s, T_s, H_s, W_s = 2, 4, 480, 640"
+
+
+STEP 5 — Run your existing notebook test (optional)
+---------------------------------------------------
+If you have notebook 12 (notebooks/12_full_model_test.ipynb)
+working with real EVIMO2 data, run it to verify end-to-end
+compatibility:
+
+    cd ~/git/EventCameraProject
+    jupyter notebook notebooks/12_full_model_test.ipynb
+
+The notebook's assertions should ALL pass:
+  - outputs["event_features"].shape == (B, 4, 256, 30, 40)
+  - outputs["decoded_feature"].shape == (B, 16, 480, 640)
+  - outputs["mask"].shape == (B, 1, 480, 640)
+  - etc.
+
+You will ALSO see 2 new keys in the output dict that the
+notebook doesn't assert on:
+  - outputs["event_pyramid"]    (list of 4 tensors)
+  - outputs["skip_features"]    (list of 3 tensors)
+
+These are added for debugging/visualization and do not affect
+the existing assertions.
+
+
+STEP 6 — Train (you still need to write the trainer)
+-----------------------------------------------------
+The trainer.py and train.py files are still EMPTY (0 bytes).
+You'll need to write them. With the patches applied, the
+training loop should look like:
+
+    from src.models.world_model.model import WorldModel
+    from src.losses.total_loss import TotalLoss
+
+    model = WorldModel(num_bins=5).to(device)
+    loss_fn = TotalLoss(
+        # All weights have sensible defaults
+        # You can tune them like this:
+        residual_loss_weight=1.0,    # warm up: 0 -> 1.0 over first 10% of training
+        dynamic_ratio_weight=0.0,   # already 0 by default (metric only)
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        weight_decay=1e-5,
+    )
+
+    for epoch in range(epochs):
+        for batch in dataloader:
+            voxels = ...  # (B, T, 5, H, W)
+            optimizer.zero_grad(set_to_none=True)
+
+            outputs = model(voxels, batch)
+            loss_output = loss_fn(outputs=outputs)
+            loss = loss_output["loss"]
+
+            # Sanity check (recommended for self-supervised losses)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at step {step}")
+
+            loss.backward()
+
+            # GRADIENT CLIPPING (essential — axis-angle singularity
+            # can produce large gradients at small rotations)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=1.0,
+            )
+
+            optimizer.step()
+
+            # Log per-loss components
+            for k, v in loss_output.items():
+                if isinstance(v, torch.Tensor) and v.dim() == 0:
+                    writer.add_scalar(f"train/{k}", v.item(), step)
+
+
+RECOMMENDED TRAINER SETTINGS
+----------------------------
+- Optimizer: AdamW, lr=1e-4, weight_decay=1e-5
+- LR schedule: CosineAnnealingLR(T_max=epochs, eta_min=1e-6)
+- Mixed precision: torch.amp.autocast('cuda', dtype=torch.bfloat16)
+- Gradient clipping: max_norm=1.0 (mandatory due to axis-angle)
+- EMA: maintain ema_model = copy.deepcopy(model).eval(),
+       update with decay 0.999 each step, use for validation IoU
+- Loss warmup: scale residual_loss_weight from 0 -> 1.0 over
+  the first ~10% of training (because residuals are noise at
+  step 0 when depth/pose are random)
+
+
+------------------------------------------------------------
+TROUBLESHOOTING
+------------------------------------------------------------
+
+Q: I get "RuntimeError: Expected tensor for argument #1 'pixels'
+   to have the same device as tensor for argument #2 'K'..."
+
+A: The K-scaling fix pins K to voxel_batch.device. Make sure you're
+   passing voxels on the right device (e.g., .to(device) before
+   calling model(...)). The model's other modules will follow the
+   voxel's device automatically.
+
+---
+
+Q: I get "ValueError: Using a target size (2, 1, 30, 40) that is
+   different to the input size (2, 1, 480, 640)..."
+
+A: This was the resolution-mismatch bug from the earlier conversation.
+   It's already fixed in dynamic_residual_loss.py (the pseudo-label
+   is bilinearly upsampled to the mask's resolution before BCE).
+   Make sure you extracted src/losses/dynamic_residual_loss.py
+   from the zip (it's a NEW file).
+
+---
+
+Q: The notebook's existing assertion fails:
+   assert outputs["event_features"].shape == (B, 4, 256, 30, 40)
+
+A: This should still pass — event_features is unchanged (it's
+   event_pyramid[-1]). If it fails, check that your input voxels
+   have shape (B, T, 5, 480, 640). The pyramid level 4 has 256
+   channels at H/16=30, W/16=40.
+
+---
+
+Q: I see "event_pyramid" and "skip_features" in the output dict.
+   Do I need to use them?
+
+A: No. They're for debugging/visualization. Your existing code that
+   only reads outputs["mask"], outputs["loss"], etc. will continue
+   to work. If you want to visualize the U-Net skips for debugging,
+   you can do:
+       for i, skip in enumerate(outputs["skip_features"]):
+           print(f"skip[{i}]: {skip.shape}, mean={skip.mean():.4f}")
+
+---
+
+Q: I have a saved checkpoint from before the patches. Can I load it?
+
+A: Use strict=False:
+       model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+   You'll see warnings about missing keys (positional_encoding,
+   new conv1 weights in the U-Net decoder) and unexpected keys
+   (old decoder weights with different channel counts). The new
+   params will be initialized from scratch; the old incompatible
+   params will be ignored. YOU MUST RETRAIN FROM SCRATCH — the
+   architecture has changed enough that fine-tuning won't work
+   well.
+
+
+------------------------------------------------------------
+ROLLBACK
+------------------------------------------------------------
+
+If the patches cause issues and you need to roll back:
+
+    cd ~/git/EventCameraProject
+    git checkout -- src/losses/dynamic_mask_regularization_loss.py
+    git checkout -- src/losses/total_loss.py
+    git checkout -- src/models/world_model/model.py
+    git checkout -- src/models/world_model/temporal_memory.py
+    git checkout -- src/models/world_model/decoder.py
+    rm src/losses/dynamic_residual_loss.py
+    rm CHANGES.md CHANGES_PATCH2.md INTEGRATION.txt
+    rm verify_patches.py compatibility_test.py
+
+Or if you used the backup approach:
+    rm -rf src
+    mv src_backup_YYYYMMDD src
+
+(Replace YYYYMMDD with your backup date.)
+
+------------------------------------------------------------
+FILE CHECKLIST (zip contents)
+------------------------------------------------------------
+
+After extraction, your repo should contain these new/modified
+files (relative to repo root):
+
+  CHANGES.md                                   (Patch Set 1 explanation)
+  CHANGES_PATCH2.md                            (Patch Set 2 explanation)
+  INTEGRATION.txt                              (this file)
+  verify_patches.py                            (Patch Set 1 verification)
+  compatibility_test.py                        (Patch Set 2 integration test)
+  src/losses/dynamic_residual_loss.py          (NEW - residual pseudo-label loss)
+  src/losses/dynamic_mask_regularization_loss.py  (rho 1.0 -> 0.05)
+  src/losses/total_loss.py                     (residual loss + detach + dynamic_ratio_weight=0)
+  src/models/world_model/model.py              (previous frame + K/16 + U-Net skips)
+  src/models/world_model/temporal_memory.py    (positional encoding)
+  src/models/world_model/decoder.py            (U-Net skip connections)
+
+11 files total. ~30KB compressed.
+
+============================================================
+END OF INTEGRATION GUIDE
+============================================================

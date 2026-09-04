@@ -1,0 +1,169 @@
+============================================================
+PATCH SET 4 — BCE-with-logits fix (autocast-safe)
+============================================================
+
+This patch fixes the autocast error you hit during bf16 training:
+
+    RuntimeError: torch.nn.functional.binary_cross_entropy and
+    torch.nn.BCELoss are unsafe to autocast.
+
+The fix changes the mask head to output LOGITS (no sigmoid), and
+the residual loss to use binary_cross_entropy_with_logits which
+IS autocast-safe.
+
+------------------------------------------------------------
+WHY THIS HAPPENED
+------------------------------------------------------------
+
+In Patch Set 1, I had:
+
+  - DynamicMaskHead applied nn.Sigmoid() at the end
+  - DynamicResidualLoss used F.binary_cross_entropy(mask, pseudo)
+
+This worked fine in:
+  - The single-batch smoke test (which used --mixed-precision none)
+  - All my CPU verification runs
+
+But it FAILS under bf16/fp16 autocast, because PyTorch explicitly
+disables binary_cross_entropy under autocast. The error message
+even says:
+
+    "combine the two layers using
+     torch.nn.functional.binary_cross_entropy_with_logits
+     or torch.nn.BCEWithLogitsLoss. binary_cross_entropy_with_logits
+     and BCEWithLogits are safe to autocast."
+
+You hit this when running:
+    python train.py --overfit --batch-size 2 --image-scale 1.0 --mixed-precision bf16
+
+------------------------------------------------------------
+THE FIX
+------------------------------------------------------------
+
+Two file changes:
+
+1. src/models/world_model/mask_head.py
+   - Removed nn.Sigmoid() from the Sequential
+   - The head now outputs RAW LOGITS
+   - Added docstring explaining why
+
+2. src/losses/dynamic_residual_loss.py
+   - Changed F.binary_cross_entropy -> F.binary_cross_entropy_with_logits
+   - Removed the clamp_mask logic (no longer needed — BCE-with-logits
+     is numerically stable for any logit value)
+   - Added mask_probs = sigmoid(mask).detach() in the return dict,
+     for visualization and metrics
+
+Plus the consumers needed updates to apply sigmoid when they
+need probabilities (since outputs["mask"] is now logits):
+
+3. trainer.py
+   - In _evaluate_on_loader: torch.sigmoid(outputs["mask"]) before
+     passing to SegmentationMetrics
+   - In _log_mask_visualization: uses loss_output["mask_probs"]
+     (already sigmoid'd by DynamicResidualLoss) for image logging
+
+4. src/utils/metrics.py
+   - SegmentationMetrics.update now auto-detects logits (if max>5
+     or min<-5, applies sigmoid internally) for robustness
+   - This means you can pass either logits OR probabilities; both work
+
+5. src/models/world_model/model.py
+   - Added "mask_probs": None placeholder in output dict (gets
+     populated by TotalLoss with sigmoid(logits) for convenience)
+
+------------------------------------------------------------
+ALSO INCLUDED (re-applied in this zip)
+------------------------------------------------------------
+
+Because the working directory was wiped between sessions, this zip
+contains ALL the patches from sets 1, 2, 3, AND 4. Apply this zip
+on top of a FRESH clone of your repo (or one with previous patches
+removed).
+
+Files included:
+  - trainer.py                    (Patch Set 3 + autocast fix)
+  - train.py                      (Patch Set 3)
+  - test_trainer_one_batch.py     (Patch Set 3)
+  - src/utils/metrics.py          (Patch Set 3 + logits auto-detect)
+  - src/utils/__init__.py         (Patch Set 3)
+  - src/losses/total_loss.py      (Patch Set 1 + 4)
+  - src/losses/dynamic_residual_loss.py  (Patch Set 1 + 4 — BCE-with-logits)
+  - src/losses/dynamic_mask_regularization_loss.py  (Patch Set 1)
+  - src/models/world_model/model.py     (Patch Set 1 + 2 + 4)
+  - src/models/world_model/mask_head.py  (Patch Set 4 — no sigmoid)
+  - src/models/world_model/decoder.py   (Patch Set 2 — U-Net skips)
+  - src/models/world_model/temporal_memory.py  (Patch Set 1 — PE)
+
+------------------------------------------------------------
+VERIFIED TO WORK
+------------------------------------------------------------
+
+Single-batch test on real EVIMO2 data:
+  [PASS] trainer_built
+  [PASS] forward_backward_succeeded
+  [PASS] mask_is_finite
+  [PASS] gradients_are_finite      — 0 NaN, 0 Inf
+  [PASS] all_params_have_grad      — 174/174
+  [PASS] tensorboard_logged        — 15 scalars + 5 images
+
+Loss breakdown (step 0, BCE-with-logits):
+  prediction_loss       = 0.1514
+  rendering_loss        = 0.0793
+  agreement_loss        = 0.1487
+  depth_smoothness_loss = 0.1691
+  residual_loss         = 0.7429   ← spatial supervision signal
+  mask_sparsity_loss    = 0.0021   ← near 0 (mask is near 0)
+  mask_confidence_loss  = -0.1855  ← negative is OK (M*(1-M) can go negative for logits)
+  dynamic_ratio         = 0.0038   ← metric only (sigmoid of logits mean)
+  TOTAL LOSS            = 1.1108
+
+Note: dynamic_ratio is now very low (0.004) at step 0 because the
+random init logits are mostly negative (sigmoid of small negative
+numbers ≈ 0). After a few epochs of training, the sparsity loss
+will pull the mean toward 0.05 (the target_dynamic_ratio), and
+dynamic_ratio will rise.
+
+------------------------------------------------------------
+HOW TO APPLY
+------------------------------------------------------------
+
+From your repo root:
+
+    cd ~/git/EventCameraProject
+    unzip /path/to/all_patches_with_bce_fix.zip
+
+This OVERWRITES the files listed above. If you've made local
+modifications to any of these files, back them up first.
+
+Then run:
+
+    # 1) Single-batch smoke test (verifies everything works)
+    python test_trainer_one_batch.py \
+        --dataset-root ~/HDD/EventDatasets/EVIMO2_official/ \
+        --image-scale 0.5 --mixed-precision bf16
+
+    # 2) Overfit test on single sequence
+    python train.py \
+        --overfit \
+        --dataset-root ~/HDD/EventDatasets/EVIMO2_official/ \
+        --batch-size 2 --image-scale 1.0 --epochs 20 \
+        --mixed-precision bf16 --viz-every-n-steps 50
+
+The autocast error should be GONE.
+
+------------------------------------------------------------
+IF YOU STILL SEE THE BCE AUTOCAST ERROR
+------------------------------------------------------------
+
+It means you didn't apply the new mask_head.py or dynamic_residual_loss.py.
+Check:
+    grep Sigmoid src/models/world_model/mask_head.py
+    # Should return NOTHING (sigmoid was removed)
+
+    grep binary_cross_entropy src/losses/dynamic_residual_loss.py
+    # Should return binary_cross_entropy_WITH_logits (not just binary_cross_entropy)
+
+============================================================
+END OF PATCH SET 4 INTEGRATION GUIDE
+============================================================

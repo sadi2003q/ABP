@@ -1,0 +1,21 @@
+# =============================================================================
+# Model Configuration
+# =============================================================================
+
+model:
+
+  name: DynamicEventNet
+
+  input_channels: 5
+
+  temporal_bins: 5
+
+  sequence_length: 5
+
+  feature_dim: 128
+
+  hidden_dim: 128
+
+  num_classes: 2
+
+  dropout: 0.10

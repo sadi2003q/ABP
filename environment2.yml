@@ -1,0 +1,24 @@
+name: EventProject
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - git
+  - rich
+  - tensorboard
+  - ffmpeg
+  - networkx
+  - pyyaml
+  - h5py
+  - ipykernel
+  - tqdm
+  - pandas
+  - scipy
+  - jupyter
+  - scikit-learn
+  - tree
+  - scikit-image
+  - matplotlib
+  - opencv
+  - numpy
+prefix: /home/ayon/miniconda3/envs/EventProject

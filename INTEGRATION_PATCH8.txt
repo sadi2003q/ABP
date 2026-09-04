@@ -1,0 +1,172 @@
+============================================================
+PATCH SET 8 — Noise detection + sparsity L1 + loss rebalancing
+============================================================
+
+This patch fixes the residual-vs-sparsity collapse issue. After
+Patch Set 7 (sparse init), training was working but IoU was very
+slow (0.009 → 0.031 peak → 0.0 collapse). The mask's dynamic_ratio
+kept rising (0.05 → 0.14) until the mask became uniform and IoU
+collapsed to 0.
+
+------------------------------------------------------------
+THE PROBLEM
+------------------------------------------------------------
+
+The sparsity loss was using L2 (squared) which is too weak near
+the target:
+
+  dr=0.05: (0.05 - 0.05)^2 = 0          (no penalty)
+  dr=0.10: (0.10 - 0.05)^2 = 0.0025    (way too weak)
+  dr=0.20: (0.20 - 0.05)^2 = 0.0225    (still weak)
+
+With weight=5.0:
+  dr=0.10: weighted = 5 * 0.0025 = 0.0125
+
+Meanwhile, the residual BCE loss produces values ~0.4-2.0. The
+residual loss completely overwhelms the sparsity loss, pushing
+the mask's dynamic_ratio from 0.05 up to 0.14+ (where IoU
+collapses because the mask becomes uniform).
+
+Additionally, the residual pseudo-label wasn't being suppressed
+when the renderer was producing noise. Even with min-max + power
+transform, the residual at random init has SOME structure (because
+the target_state has spatial structure), giving pseudo_mean ~0.11,
+which slips under the noise threshold.
+
+------------------------------------------------------------
+THE FIX (3 changes)
+------------------------------------------------------------
+
+1. L1 (abs) instead of L2 (squared) for sparsity loss
+   (src/losses/dynamic_mask_regularization_loss.py)
+
+   Before: sparsity_loss = (mean - 0.05)^2
+   After:  sparsity_loss = |mean - 0.05|
+
+   At dr=0.10:  L2 = 0.0025, L1 = 0.0500 (20x stronger)
+   At dr=0.20:  L2 = 0.0225, L1 = 0.1500 (7x stronger)
+
+   With weight=5.0:
+     dr=0.05 -> 0.00 (optimal)
+     dr=0.10 -> 0.25 (strong)
+     dr=0.20 -> 0.75 (very strong, dominates residual)
+
+2. Increased sparsity_loss_weight from 1.0 to 5.0
+   (src/losses/total_loss.py)
+
+3. Decreased residual_loss_weight from 1.0 to 0.5
+   (src/losses/total_loss.py)
+
+4. Added noise detection in DynamicResidualLoss
+   (src/losses/dynamic_residual_loss.py)
+
+   If pseudo_mean > 0.20, the loss is suppressed (returns 0).
+   This handles the case where the renderer hasn't converged.
+
+5. Forward is_noise + pseudo_mean from TotalLoss to trainer
+   (src/losses/total_loss.py + trainer.py)
+
+   Now visible in logs as "residual=ok" or "residual=NOISE"
+
+------------------------------------------------------------
+FILES CHANGED
+------------------------------------------------------------
+
+    src/losses/dynamic_mask_regularization_loss.py
+        - sparsity_loss = (mean - target).abs() instead of .pow(2)
+        - Detailed comment explaining why L1 is better
+
+    src/losses/total_loss.py
+        - sparsity_loss_weight: 1.0 -> 5.0
+        - residual_loss_weight: 1.0 -> 0.5
+        - Forward is_noise + pseudo_mean in return dict
+
+    src/losses/dynamic_residual_loss.py
+        - Added noise_threshold param (default 0.20)
+        - Added noise detection: if pseudo_mean > threshold, loss = 0
+        - Return is_noise + pseudo_mean
+
+    trainer.py
+        - Log "residual=ok" or "residual=NOISE" in console
+        - Log train/residual_is_noise and train/pseudo_label_mean_raw
+          scalars to TensorBoard
+
+------------------------------------------------------------
+VERIFIED TO WORK
+------------------------------------------------------------
+
+Single-batch test on real EVIMO2 data — all 6 checks PASS.
+
+Sparsity loss comparison (with weight=5.0):
+
+  dr=0.05: weighted = 0.00  (optimal, no penalty)
+  dr=0.08: weighted = 0.15
+  dr=0.10: weighted = 0.25  (strong, was 0.0125 with L2)
+  dr=0.15: weighted = 0.50
+  dr=0.20: weighted = 0.75  (very strong, dominates residual)
+
+Now the sparsity loss is competitive with the residual BCE loss
+(~0.4), preventing the residual from pushing dr above 0.10.
+
+------------------------------------------------------------
+EXPECTED TRAJECTORY
+------------------------------------------------------------
+
+With this patch:
+  - pred_dr should stay in [0.05, 0.10] (was rising to 0.14+)
+  - When residual is noise, "residual=NOISE" appears in logs
+    and the loss is suppressed for that step
+  - IoU should NOT collapse to 0 (the previous failure mode)
+
+Expected overfit trajectory:
+  E1:  pred_dr ≈ 0.05, IoU ≈ 0.01 (sparse init, no structure yet)
+  E10: pred_dr ≈ 0.06, IoU ≈ 0.05 (slow progress)
+  E20: pred_dr ≈ 0.07, IoU ≈ 0.10 (some spatial structure)
+  E30: pred_dr ≈ 0.08, IoU ≈ 0.15 (continuing improvement)
+
+If after 30 epochs pred_dr is still 0.05 and IoU is still ~0.01,
+the renderer hasn't converged enough for the residual to provide
+useful signal. In that case:
+  1. Train longer (the renderer takes time)
+  2. Or try the deferred fixes (6D rotation, etc.)
+
+------------------------------------------------------------
+HOW TO APPLY
+------------------------------------------------------------
+
+From your repo root:
+
+    cd ~/git/EventCameraProject
+    unzip /path/to/sparsity_l1_fix.zip
+
+This OVERWRITES:
+    src/losses/dynamic_mask_regularization_loss.py
+    src/losses/total_loss.py
+    src/losses/dynamic_residual_loss.py
+    trainer.py
+
+Then verify:
+
+    python test_trainer_one_batch.py \
+        --dataset-root ~/one_sequence/ \
+        --image-scale 0.5 --mixed-precision bf16
+
+You should see:
+    mask_sparsity_loss    = 0.00xxx   (near zero, dr ≈ 0.05)
+    dynamic_ratio         = 0.05xxx   (sparse)
+
+Then re-run your overfit training:
+
+    python train.py --overfit \
+        --dataset-root ~/one_sequence/ \
+        --batch-size 4 --image-scale 1.0 --epochs 100 \
+        --mixed-precision bf16 --viz-every-n-steps 50
+
+Watch in logs:
+  - "residual=ok" or "residual=NOISE" status
+  - pred_dr should stay in [0.05, 0.10] (NOT rise to 0.14+)
+  - IoU should NOT collapse to 0
+
+============================================================
+END OF PATCH SET 8 INTEGRATION GUIDE
+============================================================

@@ -1,0 +1,26 @@
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+
+logging:
+
+  # Logging level
+  level: INFO
+
+  # Log format
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+
+  # Date format
+  datefmt: "%Y-%m-%d %H:%M:%S"
+
+  # Save logs to file
+  save_to_file: true
+
+  # Log filename
+  filename: event_project.log
+
+  # Log directory
+  directory: logs
+
+  # Also print logs to terminal
+  console: true

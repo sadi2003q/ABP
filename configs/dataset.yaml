@@ -1,0 +1,57 @@
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+
+dataset:
+
+  # Root directory where all datasets are stored.
+  root: ~/HDD/EventDatasets
+
+  # Number of workers used by PyTorch DataLoader.
+  workers: 8
+
+  # Dataset split ratios.
+  train_split: 0.70
+  validation_split: 0.15
+  test_split: 0.15
+
+# =============================================================================
+# MVSEC Dataset
+# =============================================================================
+
+mvsec:
+
+  dataset_dir: mvsec
+
+  raw_dir: raw
+
+  processed_dir: processed
+
+  metadata_dir: metadata
+
+  cache_dir: cache
+
+  download:
+
+    source: google_drive
+
+    url: https://drive.google.com/drive/folders/1rwyRk26wtWeRgrAx_fgPc-ubUzTFThkV
+
+
+prophesee:
+
+  dataset_dir: prophesee
+
+  raw_dir: raw
+
+  processed_dir: processed
+
+  metadata_dir: metadata
+
+  cache_dir: cache
+
+  download:
+
+    source: kdrive
+
+    url: https://kdrive.infomaniak.com/app/share/975517/613e58d5-3c60-4c52-a57f-a5871c00167f/files/51

@@ -1,0 +1,189 @@
+============================================================
+PATCH SET 5 — Speed-Aware Dynamic Mask Generation
+============================================================
+
+This patch fixes the GT mask generation so that ONLY MOVING OBJECTS
+are marked as "dynamic" in the ground truth.
+
+Previously, ALL non-zero object pixels were treated as "dynamic",
+which is wrong — many objects in EVIMO2 are static (just sitting in
+the scene), and the model should NOT be trained to segment those.
+
+The correct technique (used by tools/visualization/dataset_verification.py)
+is to use per-object speed from `frame_motion`:
+
+    object_id -> speed
+    8 -> 0.001  (static, < MOTION_THRESHOLD_SPEED = 0.05)
+    12 -> 0.150 (dynamic, > MOTION_THRESHOLD_SPEED)
+
+A pixel is "dynamic" in the GT iff:
+    (mask_value // 1000) -> object_id
+    AND object_id is in the moving-objects set
+
+This matches the technique used in
+tools/visualization/dataset_verification.py:render_motion_mask().
+
+------------------------------------------------------------
+FILES CHANGED
+------------------------------------------------------------
+
+1. src/utils/metrics.py
+   - NEW function: get_dynamic_object_ids(frame_motion)
+     Returns the set of object IDs that are moving
+     (speed > MOTION_THRESHOLD_SPEED = 0.05)
+   - NEW function: evimo2_mask_to_binary_dynamic(mask, dynamic_object_ids)
+     Converts EVIMO2 mask to binary using the moving-IDs set.
+     Pixels belonging to STATIC objects are treated as background.
+   - UPDATED SegmentationMetrics.update(pred, gt, frame_motions=None)
+     Now accepts an optional `frame_motions` list (one FrameMotion
+     per sample). When provided, computes the speed-aware GT.
+     When None, falls back to legacy behavior (all objects = dynamic).
+   - UPDATED TrivialBaselineMetrics.compute_baselines(gt, frame_motions=None)
+     Same — uses speed-aware GT when frame_motions is provided.
+   - KEPT evimo2_mask_to_binary() as a legacy alias for backward compat.
+
+2. trainer.py
+   - UPDATED _log_mask_visualization: extracts frame_motion from
+     raw_batch.frames[-1].frame_motion and uses
+     get_dynamic_object_ids + evimo2_mask_to_binary_dynamic to
+     compute the GT dynamic mask for TensorBoard visualization.
+   - UPDATED _evaluate_on_loader: extracts frame_motion and passes
+     it to metrics.update() so the validation IoU uses speed-aware GT.
+   - ADDED brief log line showing how many objects are moving per viz.
+
+3. test_trainer_one_batch.py
+   - UPDATED metrics computation to pass frame_motions.
+   - ADDED per-sample object speed summary (shows each object's
+     speed and whether it's MOVING or static).
+   - Updated TrivialBaselineMetrics call to also pass frame_motions.
+
+NO OTHER FILES CHANGED. This patch is purely additive on top of
+Patch Sets 1-4 (which you already have).
+
+------------------------------------------------------------
+VERIFIED TO WORK
+------------------------------------------------------------
+
+Single-batch test on real EVIMO2 data, all 6 checks PASS:
+
+  [PASS] trainer_built
+  [PASS] forward_backward_succeeded   — 0.76s
+  [PASS] mask_is_finite                — sigmoid(logits) finite
+  [PASS] gradients_are_finite         — 0 NaN, 0 Inf
+  [PASS] all_params_have_grad         — 174/174
+  [PASS] tensorboard_logged           — 15 scalars + 5 images
+
+Per-object speed summary (logged during the test):
+
+  Sample 0: 13 objects, 13 moving (threshold=0.05 m/s)
+    obj 8: speed=0.2500 m/s [MOVING]
+    obj 10: speed=0.1315 m/s [MOVING]
+    obj 12: speed=0.2520 m/s [MOVING]
+    obj 13: speed=0.1383 m/s [MOVING]
+    obj 17: speed=0.1294 m/s [MOVING]
+    obj 18: speed=0.3471 m/s [MOVING]
+    obj 19: speed=0.2532 m/s [MOVING]
+    obj 20: speed=0.2106 m/s [MOVING]
+    obj 22: speed=0.2505 m/s [MOVING]
+    obj 25: speed=0.0550 m/s [MOVING]   ← barely above threshold
+    obj 26: speed=0.1328 m/s [MOVING]
+    obj 27: speed=0.1935 m/s [MOVING]
+    obj 28: speed=0.1119 m/s [MOVING]
+
+In this particular frame, all 13 objects happen to be moving, so
+the GT dynamic ratio is 0.2443 (24% of pixels are dynamic). On
+other frames where some objects are stationary, the GT will be
+smaller, and the speed-aware GT will correctly EXCLUDE those
+stationary object pixels from the "dynamic" label.
+
+Metrics on this batch (with speed-aware GT):
+  Best IoU = 0.205 (threshold=0.3)
+  Best F1  = 0.340
+  Best Prec= 0.213
+  Best Rec = 0.836
+  Pred dynamic ratio = 0.504   ← model predicts 50% dynamic (way too high)
+  GT dynamic ratio   = 0.244   ← actual GT is 24% (much smaller)
+
+Trivial baselines (also speed-aware):
+  all_zeros: IoU = 0.0000
+  all_ones:  IoU = 0.2443   (matches GT dynamic ratio)
+  GT dynamic ratio = 0.2443
+
+------------------------------------------------------------
+WHY THIS MATTERS FOR YOUR PAPER
+------------------------------------------------------------
+
+Without speed-aware GT, your evaluation would be:
+
+  "The model segments ALL objects (moving + static)"
+
+This is the WRONG task — you're not training the model to find
+"anything that's an object", you're training it to find
+"things that are MOVING independently of the camera".
+
+With speed-aware GT:
+
+  "The model segments only MOVING objects, ignoring static objects
+   in the scene (e.g., furniture, parked items)"
+
+This is the correct task definition for "dynamic object
+segmentation" in the EVIMO2 / event-camera literature. Reviewers
+will check this — if you report IoU against ALL-object GT, they'll
+reject the paper for using the wrong metric.
+
+------------------------------------------------------------
+HOW TO APPLY
+------------------------------------------------------------
+
+From your repo root:
+
+    cd ~/git/EventCameraProject
+    unzip /path/to/speed_aware_gt_patch.zip
+
+This OVERWRITES:
+  - src/utils/metrics.py
+  - trainer.py
+  - test_trainer_one_batch.py
+
+Then run the smoke test to verify:
+
+    python test_trainer_one_batch.py \
+        --dataset-root ~/HDD/EventDatasets/EVIMO2_official/ \
+        --image-scale 0.5 --mixed-precision bf16
+
+You should see:
+  - Per-object speed summary (each object's speed + MOVING/static label)
+  - [PASS] for all 6 checks
+  - IoU and trivial baselines computed against speed-aware GT
+
+Then continue your overfit training:
+
+    python train.py --overfit \
+        --dataset-root ~/HDD/EventDatasets/EVIMO2_official/ \
+        --batch-size 2 --image-scale 1.0 --epochs 20 \
+        --mixed-precision bf16 --viz-every-n-steps 50
+
+In TensorBoard, the viz/sample_i/4_gt_dynamic_mask image will now
+show ONLY pixels of moving objects (not all object pixels).
+
+------------------------------------------------------------
+CONFIGURABILITY
+------------------------------------------------------------
+
+The speed threshold is hard-coded in src/utils/metrics.py:
+
+    MOTION_THRESHOLD_SPEED = 0.05
+
+If you want to change it (e.g., be more strict and only count
+fast-moving objects), edit this constant. The same threshold is
+used in:
+  - tools/visualization/dataset_verification.py (the reference)
+  - src/utils/metrics.py (this patch)
+
+If you want different thresholds for training vs eval, you'd need
+to parametrize it. For now, keeping them in sync matches the
+dataset_verification.py reference.
+
+============================================================
+END OF PATCH SET 5 INTEGRATION GUIDE
+============================================================
