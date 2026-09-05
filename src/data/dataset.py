@@ -85,6 +85,7 @@ class EVIMO2Dataset(Dataset):
         split: str = "train",
         load_depth: bool = True,
         load_mask: bool = True,
+        subset: str = "imo",
     ):
 
         super().__init__()
@@ -100,6 +101,7 @@ class EVIMO2Dataset(Dataset):
             dataset_root=dataset_root,
             sensors=sensors,
             split=split,
+            subset=subset,
         )
 
         #

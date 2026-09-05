@@ -121,6 +121,7 @@ class SequenceIndex:
         dataset_root: str | Path,
         sensors: tuple[str, ...] | list[str] | None = None,
         split: str = "train",
+        subset: str = "imo",
     ):
 
         self.dataset_root = Path(dataset_root).expanduser()
@@ -132,6 +133,7 @@ class SequenceIndex:
         )
 
         self.split = split
+        self.subset = subset
 
         self.sequences: list[SequenceInfo] = (
             self._discover_sequences()
@@ -174,7 +176,7 @@ class SequenceIndex:
 
             split_root = (
                 sensor_root /
-                "imo" /
+                self.subset /
                 self.split
             )
 
@@ -199,7 +201,7 @@ class SequenceIndex:
                 rgb_sequence_dir = (
                     self.dataset_root
                     / "flea3_7"
-                    / "imo"
+                    / self.subset
                     / self.split
                     / sequence_dir.name
                 )

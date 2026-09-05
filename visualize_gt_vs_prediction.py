@@ -476,6 +476,9 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4,
                          help="Number of dataloader worker processes.")
     parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--subset", type=str, default="imo",
+                     help="Subset folder name under each sensor, e.g. "
+                          "'imo', 'imo_II', 'sanity', 'sanity_II', 'sfm', 'sfm_II'.")
     parser.add_argument("--overfit", action="store_true",
                          help="Use the project's overfit dataset behavior.")
     parser.add_argument("--no-ema", action="store_true",
@@ -507,6 +510,7 @@ def main():
         dataset_root=args.dataset_root,
         sensors=tuple(args.sensors),
         split=args.split,
+        subset=args.subset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         overfit_mode=args.overfit,

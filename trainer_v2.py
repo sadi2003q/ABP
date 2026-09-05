@@ -32,6 +32,7 @@ class TrainConfigV2:
     dataset_root: str = "/home/z/my-project/data/dataset_root"
     sensors: tuple = ("left_camera",)
     split: str = "train"
+    subset: str = "imo" 
     val_split: str = "val"
     history_offsets: tuple = (-12, -8, -4, 0)
     num_bins: int = 5
@@ -156,6 +157,7 @@ class TrainerV2:
             dataset_root=self.cfg.dataset_root,
             sensors=self.cfg.sensors, split=self.cfg.split,
             load_depth=True, load_mask=True,
+            subset=self.cfg.subset
         )
         tds = TemporalEVIMO2Dataset(ds, history_offsets=self.cfg.history_offsets)
         logger.info(f"Train: {len(tds)} windows")
@@ -171,6 +173,7 @@ class TrainerV2:
                     dataset_root=self.cfg.dataset_root,
                     sensors=self.cfg.sensors, split=self.cfg.val_split,
                     load_depth=True, load_mask=True,
+                    subset=self.cfg.subset
                 )
                 vtds = TemporalEVIMO2Dataset(vds, history_offsets=self.cfg.history_offsets)
                 self.val_loader = DataLoader(
