@@ -4,61 +4,50 @@ visualize_gt_vs_prediction.py
 
 Purpose
 -------
-Visualize EXACTLY what the V2 model predicts for dynamic-object segmentation
-and compare it against the EVIMO2 Ground Truth.
+Produce clear, presentation-ready figures answering exactly the question
+your supervisor asked:
 
-This script is deliberately standalone. It does not modify the training code.
+    "What is the model predicting, and how does it compare to the
+     Ground Truth used to compute the F1 / IoU score?"
 
-The prediction used here is:
+For each visualized frame this script saves ONE combined figure with
+four panels, side by side:
 
-    prediction_probability = sigmoid(model_output["mask"])
+    [ Event input ]  [ Ground Truth ]  [ Prediction ]  [ Overlay: TP/FP/FN ]
 
-This is the same prediction representation used by trainer_v2.py for
-SegmentationMetrics.
+- Event input        : the actual event-camera voxel grid the model saw,
+                        rendered as a red/blue polarity image (this
+                        dataset has no classical/RGB frames — EVIMO2
+                        "left_camera" sequences are event-only).
+- Ground Truth        : the EVIMO2 dynamic-object mask (speed-thresholded,
+                         same logic used for the F1/IoU number).
+- Prediction          : sigmoid(model_output["mask"]) thresholded at the
+                         best IoU threshold — the EXACT quantity F1/IoU
+                         is computed from in trainer_v2.py.
+- Overlay             : green = correct detection (TP), red = false
+                         alarm (FP), blue = missed detection (FN),
+                         black = correct background (TN).
 
-The script evaluates thresholds:
+It also saves:
+    - metrics.txt               (global IoU/F1/precision/recall + best threshold)
+    - per-sample metrics.txt    (inside each sample folder)
+    - threshold_sweep.png       (IoU/F1 vs threshold — shows the model
+                                  isn't just getting lucky at one cutoff)
 
-    0.3, 0.4, 0.5, 0.6, 0.7
-
-and selects the threshold with the highest IoU, matching the existing
-evaluation logic.
-
-Output
-------
-For selected frames:
-
-    input.png
-    ground_truth.png
-    prediction_probability.png
-    prediction_binary.png
-    comparison.png
-
-comparison.png uses:
-
-    GREEN = True Positive
-    RED   = False Positive
-    BLUE  = False Negative
-    BLACK = True Negative
-
-It also writes:
-
-    metrics.txt
+This script is standalone and does not modify the training code.
 """
 
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# -------------------------------------------------------------------------
-# Project imports
-# -------------------------------------------------------------------------
-
-from trainer_v2 import TrainerV2, TrainerConfig
+from trainer_v2 import TrainerV2, TrainConfigV2
 from src.utils.metrics import (
     get_dynamic_object_ids,
     evimo2_mask_to_binary_dynamic,
@@ -73,53 +62,82 @@ THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7]
 
 
 # -------------------------------------------------------------------------
-# Image utilities
+# Event voxel -> viewable image
 # -------------------------------------------------------------------------
 
-def normalize_to_uint8(x):
+def voxel_to_event_image(voxel, percentile=99.0, gamma=0.5):
     """
-    Convert a tensor/array into uint8 [0, 255].
+    Convert an event voxel grid (num_bins, H, W) into a viewable RGB
+    image using the standard event-camera convention:
+
+        red   = net positive polarity activity at that pixel
+        blue  = net negative polarity activity at that pixel
+        black = no events
+
+    Event cameras routinely have a handful of "hot pixels" that fire
+    far more often than every real, meaningful pixel (e.g. one pixel
+    at 80+ net events while the 99th percentile of the rest of the
+    frame is ~6). Normalizing by the raw max would make everything
+    else look black. Instead we clip to a high percentile of the
+    nonzero activity (robust to hot pixels) and apply a gamma curve
+    (events are naturally sparse/skewed, so a linear map still looks
+    mostly black — gamma<1 brightens midtones for visibility).
+
+    Parameters
+    ----------
+    voxel : torch.Tensor or np.ndarray, shape (num_bins, H, W)
+    percentile : float
+        Percentile of nonzero |activity| used as the clipping ceiling.
+    gamma : float
+        Exponent applied after normalizing to [0, 1]. <1 brightens.
+
+    Returns
+    -------
+    np.ndarray uint8, shape (H, W, 3)
     """
-    x = np.asarray(x, dtype=np.float32)
+    if torch.is_tensor(voxel):
+        voxel = voxel.detach().cpu().numpy()
 
-    x_min = x.min()
-    x_max = x.max()
+    voxel = np.asarray(voxel, dtype=np.float32)
 
-    if x_max > x_min:
-        x = (x - x_min) / (x_max - x_min)
-    else:
-        x = np.zeros_like(x)
+    # Sum across time bins -> net polarity per pixel.
+    net = voxel.sum(axis=0)  # (H, W)
 
-    return (x * 255.0).clip(0, 255).astype(np.uint8)
+    pos = np.clip(net, 0, None)
+    neg = np.clip(-net, 0, None)
+
+    def normalize(x):
+        nonzero = x[x > 0]
+        if nonzero.size == 0:
+            return x
+        ceiling = np.percentile(nonzero, percentile)
+        if ceiling <= 1e-8:
+            ceiling = nonzero.max()
+        x = np.clip(x / ceiling, 0, 1)
+        return x ** gamma
+
+    pos = normalize(pos)
+    neg = normalize(neg)
+
+    pos = normalize(pos)
+    neg = normalize(neg)
+
+    image = np.zeros((*net.shape, 3), dtype=np.float32)
+    image[..., 0] = pos   # red channel   = positive events
+    image[..., 2] = neg   # blue channel  = negative events
+
+    return (image * 255.0).clip(0, 255).astype(np.uint8)
 
 
-def save_gray(array, path):
+def make_overlay(gt, pred):
     """
-    Save a grayscale image.
+    TP/FP/FN/TN visualization.
+
+        GREEN = True Positive  (correct dynamic-object detection)
+        RED   = False Positive (false alarm)
+        BLUE  = False Negative (missed detection)
+        BLACK = True Negative  (correct background)
     """
-    array = normalize_to_uint8(array)
-    Image.fromarray(array, mode="L").save(path)
-
-
-def save_binary(mask, path):
-    """
-    Save binary mask as black/white.
-    """
-    mask = np.asarray(mask).astype(np.uint8)
-    image = mask * 255
-    Image.fromarray(image, mode="L").save(path)
-
-
-def make_comparison(gt, pred):
-    """
-    Create TP/FP/FN/TN visualization.
-
-    GREEN = TP
-    RED   = FP
-    BLUE  = FN
-    BLACK = TN
-    """
-
     gt = np.asarray(gt).astype(bool)
     pred = np.asarray(pred).astype(bool)
 
@@ -127,79 +145,12 @@ def make_comparison(gt, pred):
     fp = (~gt) & pred
     fn = gt & (~pred)
 
-    comparison = np.zeros(
-        (gt.shape[0], gt.shape[1], 3),
-        dtype=np.uint8,
-    )
+    overlay = np.zeros((*gt.shape, 3), dtype=np.uint8)
+    overlay[tp] = [0, 255, 0]
+    overlay[fp] = [255, 0, 0]
+    overlay[fn] = [0, 0, 255]
 
-    # True Positive = green
-    comparison[tp] = [0, 255, 0]
-
-    # False Positive = red
-    comparison[fp] = [255, 0, 0]
-
-    # False Negative = blue
-    comparison[fn] = [0, 0, 255]
-
-    return comparison
-
-
-def save_input_image(frame, path):
-    """
-    Try to save an EVIMO frame if available.
-
-    This function handles common tensor/array formats.
-    """
-
-    if frame is None:
-        return False
-
-    x = frame
-
-    if torch.is_tensor(x):
-        x = x.detach().cpu()
-
-        if x.ndim == 3 and x.shape[0] in (1, 3):
-            x = x.permute(1, 2, 0)
-
-        x = x.numpy()
-
-    x = np.asarray(x)
-
-    if x.ndim == 2:
-        Image.fromarray(normalize_to_uint8(x), mode="L").save(path)
-        return True
-
-    if x.ndim == 3:
-
-        # CHW -> HWC
-        if x.shape[0] in (1, 3):
-            x = np.transpose(x, (1, 2, 0))
-
-        if x.shape[-1] == 1:
-            Image.fromarray(
-                normalize_to_uint8(x[..., 0]),
-                mode="L",
-            ).save(path)
-            return True
-
-        if x.shape[-1] == 3:
-            x = x.astype(np.float32)
-
-            # Handle [0,1]
-            if x.max() <= 1.0:
-                x = x * 255.0
-
-            # Handle arbitrary normalized input
-            if x.min() < 0:
-                x = normalize_to_uint8(x)
-            else:
-                x = x.clip(0, 255).astype(np.uint8)
-
-            Image.fromarray(x, mode="RGB").save(path)
-            return True
-
-    return False
+    return overlay
 
 
 # -------------------------------------------------------------------------
@@ -207,10 +158,6 @@ def save_input_image(frame, path):
 # -------------------------------------------------------------------------
 
 def calculate_metrics(gt, pred):
-    """
-    Calculate binary segmentation metrics.
-    """
-
     gt = np.asarray(gt).astype(bool)
     pred = np.asarray(pred).astype(bool)
 
@@ -219,34 +166,15 @@ def calculate_metrics(gt, pred):
     fn = np.logical_and(gt, ~pred).sum()
 
     union = tp + fp + fn
-
-    if union > 0:
-        iou = tp / union
-    else:
-        iou = 1.0
+    iou = tp / union if union > 0 else 1.0
 
     precision_den = tp + fp
     recall_den = tp + fn
-
-    precision = (
-        tp / precision_den
-        if precision_den > 0
-        else 0.0
-    )
-
-    recall = (
-        tp / recall_den
-        if recall_den > 0
-        else 0.0
-    )
+    precision = tp / precision_den if precision_den > 0 else 0.0
+    recall = tp / recall_den if recall_den > 0 else 0.0
 
     f1_den = precision + recall
-
-    f1 = (
-        2.0 * precision * recall / f1_den
-        if f1_den > 0
-        else 0.0
-    )
+    f1 = 2.0 * precision * recall / f1_den if f1_den > 0 else 0.0
 
     return {
         "iou": float(iou),
@@ -260,34 +188,30 @@ def calculate_metrics(gt, pred):
 
 
 # -------------------------------------------------------------------------
-# Main evaluation
+# Main evaluation loop
 # -------------------------------------------------------------------------
 
 @torch.no_grad()
-def collect_predictions(trainer, loader):
+def collect_predictions(trainer, loader, max_batches=None):
     """
-    Run the model over the loader and collect EXACTLY the same type of
-    prediction used by trainer_v2 evaluation.
+    Run the model over the loader and collect EXACTLY the same
+    prediction representation used by trainer_v2's SegmentationMetrics:
 
-    Returns
-    -------
-    samples:
-        list of dictionaries containing:
+        prediction_probability = sigmoid(model_output["mask"])
 
-            probability
-            ground_truth
-            input_frame
-            sample_index
+    Returns a list of dicts: probability, ground_truth, event_image,
+    sample_index.
     """
-
     model = trainer.model
     model.eval()
 
     samples = []
-
     global_index = 0
 
-    for raw in loader:
+    for batch_index, raw in enumerate(loader):
+
+        if max_batches is not None and batch_index >= max_batches:
+            break
 
         # Same transformation used by training/evaluation.
         vb = trainer.transform(raw)
@@ -301,80 +225,67 @@ def collect_predictions(trainer, loader):
         vb = vb.to(trainer.device)
 
         # -------------------------------------------------------------
-        # THIS IS THE IMPORTANT PART
+        # THIS IS THE EXACT PREDICTION F1/IoU IS CALCULATED FROM.
         # -------------------------------------------------------------
-        #
-        # This is the model prediction that F1/IoU is calculated from.
-        #
         out = model(vox, vb)
-
         mask_logits = out["mask"]
-
         prediction_probability = torch.sigmoid(mask_logits)
-
         # -------------------------------------------------------------
 
-        # EVIMO2 GT
+        # Photometric residual that feeds the mask-refinement head —
+        # shows WHY the model predicted what it predicted.
+        residual = out.get("residual")
+        if residual is None:
+            residual = torch.zeros_like(mask_logits)
+
+        # Reference-frame voxel grid, for the event input image
+        # (last timestep = the frame the mask/prediction correspond to).
+        ref_voxels = vb.frames[-1].voxel_grid  # (B, num_bins, H, W)
+
         raw_masks = raw.frames[-1].mask
         frame_motions = raw.frames[-1].frame_motion
 
-        for batch_index, (prob, raw_gt, motion) in enumerate(
-            zip(
-                prediction_probability,
-                raw_masks,
-                frame_motions,
-            )
+        for prob, raw_gt, motion, voxel, res in zip(
+            prediction_probability,
+            raw_masks,
+            frame_motions,
+            ref_voxels,
+            residual,
         ):
-
             # Some EVIMO frames legitimately have no mask.
             if raw_gt is None:
                 global_index += 1
                 continue
 
-            # Dynamic object IDs are determined from object speed,
+            # Dynamic object IDs, determined from object speed —
             # exactly like the project's evaluation.
             dynamic_ids = get_dynamic_object_ids(motion)
 
-            gt = evimo2_mask_to_binary_dynamic(
-                raw_gt,
-                dynamic_ids,
-            )
+            gt = evimo2_mask_to_binary_dynamic(raw_gt, dynamic_ids)
+            gt = torch.as_tensor(gt).squeeze()  # -> (H, W)
 
-            # Convert prediction to [H,W].
-            prob = prob.squeeze()
+            prob = prob.squeeze()  # -> (H, W)
 
-            # Match the exact spatial resizing used by evaluation.
-            if tuple(prob.shape[-2:]) != tuple(gt.shape):
-
+            # Match spatial resizing used by evaluation (only if needed).
+            gt_hw = tuple(gt.shape[-2:])
+            if tuple(prob.shape[-2:]) != gt_hw:
                 prob = F.interpolate(
                     prob.unsqueeze(0).unsqueeze(0),
-                    size=gt.shape,
+                    size=gt_hw,
                     mode="bilinear",
                     align_corners=False,
                 ).squeeze()
 
-            probability_np = (
-                prob.detach()
-                .cpu()
-                .numpy()
-                .astype(np.float32)
-            )
-
-            gt_np = (
-                gt.detach()
-                .cpu()
-                .numpy()
-                .astype(np.uint8)
-                if torch.is_tensor(gt)
-                else np.asarray(gt).astype(np.uint8)
-            )
+            event_image = voxel_to_event_image(voxel)
+            residual_np = res.squeeze().detach().cpu().numpy().astype(np.float32)
 
             samples.append(
                 {
-                    "probability": probability_np,
-                    "ground_truth": gt_np,
+                    "probability": prob.detach().cpu().numpy().astype(np.float32),
+                    "ground_truth": gt.detach().cpu().numpy().astype(np.uint8),
+                    "event_image": event_image,
+                    "residual": residual_np,
                     "sample_index": global_index,
-                    "input": None,
                 }
             )
 
@@ -383,209 +294,161 @@ def collect_predictions(trainer, loader):
     return samples
 
 
-# -------------------------------------------------------------------------
-# Find best threshold
-# -------------------------------------------------------------------------
-
 def find_best_threshold(samples):
     """
-    Calculate aggregate IoU/F1 for every threshold.
-
-    This follows the same threshold sweep used by SegmentationMetrics.
+    Aggregate IoU/F1 across ALL pixels of ALL samples, for every
+    threshold. This is the global, dataset-level version of the metric
+    (matches how trainer_v2's SegmentationMetrics aggregates).
     """
-
     results = []
 
     for threshold in THRESHOLDS:
-
-        total_tp = 0
-        total_fp = 0
-        total_fn = 0
+        total_tp = total_fp = total_fn = 0
 
         for sample in samples:
-
             gt = sample["ground_truth"].astype(bool)
+            pred = sample["probability"] >= threshold
 
-            pred = (
-                sample["probability"] >= threshold
-            )
-
-            total_tp += np.logical_and(
-                gt,
-                pred,
-            ).sum()
-
-            total_fp += np.logical_and(
-                ~gt,
-                pred,
-            ).sum()
-
-            total_fn += np.logical_and(
-                gt,
-                ~pred,
-            ).sum()
+            total_tp += np.logical_and(gt, pred).sum()
+            total_fp += np.logical_and(~gt, pred).sum()
+            total_fn += np.logical_and(gt, ~pred).sum()
 
         union = total_tp + total_fp + total_fn
-
-        iou = (
-            total_tp / union
-            if union > 0
-            else 1.0
-        )
+        iou = total_tp / union if union > 0 else 1.0
 
         precision_den = total_tp + total_fp
         recall_den = total_tp + total_fn
-
-        precision = (
-            total_tp / precision_den
-            if precision_den > 0
-            else 0.0
-        )
-
-        recall = (
-            total_tp / recall_den
-            if recall_den > 0
-            else 0.0
-        )
+        precision = total_tp / precision_den if precision_den > 0 else 0.0
+        recall = total_tp / recall_den if recall_den > 0 else 0.0
 
         f1_den = precision + recall
+        f1 = 2 * precision * recall / f1_den if f1_den > 0 else 0.0
 
-        f1 = (
-            2 * precision * recall / f1_den
-            if f1_den > 0
-            else 0.0
-        )
+        results.append({
+            "threshold": threshold,
+            "iou": float(iou),
+            "f1": float(f1),
+            "precision": float(precision),
+            "recall": float(recall),
+        })
 
-        results.append(
-            {
-                "threshold": threshold,
-                "iou": float(iou),
-                "f1": float(f1),
-                "precision": float(precision),
-                "recall": float(recall),
-            }
-        )
-
-    # IMPORTANT:
-    # The project's SegmentationMetrics selects best IoU threshold.
-    best = max(
-        results,
-        key=lambda x: x["iou"],
-    )
-
+    best = max(results, key=lambda x: x["iou"])
     return best, results
 
 
+def plot_threshold_sweep(all_results, output_dir):
+    thresholds = [r["threshold"] for r in all_results]
+    ious = [r["iou"] for r in all_results]
+    f1s = [r["f1"] for r in all_results]
+
+    fig, ax = plt.subplots(figsize=(6, 4.5), dpi=150)
+    ax.plot(thresholds, ious, marker="o", label="IoU", color="#1f77b4")
+    ax.plot(thresholds, f1s, marker="s", label="F1", color="#ff7f0e")
+    ax.set_xlabel("Threshold")
+    ax.set_ylabel("Score")
+    ax.set_title("IoU / F1 vs Decision Threshold")
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path(output_dir) / "threshold_sweep.png")
+    plt.close(fig)
+
+
 # -------------------------------------------------------------------------
-# Save visualizations
+# Combined 4-panel figure
 # -------------------------------------------------------------------------
 
-def save_visualizations(
-    samples,
-    output_dir,
-    threshold,
-    max_images,
-):
+def save_combined_figure(sample, threshold, path):
     """
-    Save Ground Truth vs Prediction visualizations.
+    Save one figure with 5 panels:
+        Event input | Residual | Ground Truth | Prediction | Overlay (TP/FP/FN)
     """
+    probability = sample["probability"]
+    gt = sample["ground_truth"].astype(bool)
+    prediction = probability >= threshold
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
+    overlay = make_overlay(gt, prediction)
+    metrics = calculate_metrics(gt, prediction)
+
+    fig, axes = plt.subplots(1, 5, figsize=(19, 4.3), dpi=150)
+
+    axes[0].imshow(sample["event_image"])
+    axes[0].set_title("Event input\n(red=+ / blue=-)")
+
+    axes[1].imshow(sample["residual"], cmap="inferno")
+    axes[1].set_title("Photometric residual\n(feeds mask-refinement head)")
+
+    axes[2].imshow(gt, cmap="gray", vmin=0, vmax=1)
+    axes[2].set_title("Ground Truth\n(dynamic-object mask)")
+
+    axes[3].imshow(prediction, cmap="gray", vmin=0, vmax=1)
+    axes[3].set_title(f"Prediction (thr={threshold:.2f})\nsigmoid(model_output['mask'])")
+
+    axes[4].imshow(overlay)
+    axes[4].set_title(
+        f"Overlay: IoU={metrics['iou']:.3f} F1={metrics['f1']:.3f}\n"
+        f"green=TP red=FP blue=FN"
     )
 
-    selected = samples[:max_images]
+    for ax in axes:
+        ax.axis("off")
+
+    fig.suptitle(f"Sample {sample['sample_index']}", y=1.03, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+    return metrics
+
+
+def save_visualizations(samples, output_dir, threshold, max_images):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Most EVIMO2 frames legitimately have ZERO dynamic-object pixels
+    # (objects present but not moving fast enough at that instant —
+    # only ~20-25% of frames in a typical sequence have any moving
+    # object at all). Selecting samples[:max_images] in dataloader
+    # order (shuffled) mostly shows those empty frames by chance,
+    # which looks like a broken model even when it isn't.
+    #
+    # Instead, rank samples by how much dynamic GT they contain and
+    # show a MIX: the most GT-active frames first (so you can actually
+    # see the model detect something), followed by a couple of
+    # GT-empty frames (so you can also confirm the model correctly
+    # predicts "nothing" when there's nothing — that's a real, useful
+    # result too, not a bug).
+    def gt_pixel_count(s):
+        return int(s["ground_truth"].sum())
+
+    ranked = sorted(samples, key=gt_pixel_count, reverse=True)
+
+    n_active = max(1, int(max_images * 0.8))
+    active = [s for s in ranked if gt_pixel_count(s) > 0][:n_active]
+    empty = [s for s in ranked if gt_pixel_count(s) == 0][: max_images - len(active)]
+    selected = (active + empty)[:max_images]
+
+    if not active:
+        print("  NOTE: none of the collected samples have any dynamic-object "
+              "GT pixels. Showing empty frames only — try --num-images higher "
+              "or a different --split to catch frames with real motion.")
 
     for sample_number, sample in enumerate(selected):
+        sample_dir = output_dir / f"sample_{sample_number:04d}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
 
-        probability = sample["probability"]
-        gt = sample["ground_truth"]
-
-        prediction = (
-            probability >= threshold
-        ).astype(np.uint8)
-
-        sample_dir = (
-            output_dir
-            / f"sample_{sample_number:04d}"
+        metrics = save_combined_figure(
+            sample,
+            threshold,
+            sample_dir / "comparison.png",
         )
 
-        sample_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        # -------------------------------------------------------------
-        # 1. Ground Truth
-        # -------------------------------------------------------------
-
-        save_binary(
-            gt,
-            sample_dir / "ground_truth.png",
-        )
-
-        # -------------------------------------------------------------
-        # 2. Prediction probability
-        # -------------------------------------------------------------
-
-        save_gray(
-            probability,
-            sample_dir / "prediction_probability.png",
-        )
-
-        # -------------------------------------------------------------
-        # 3. Binary prediction
-        # -------------------------------------------------------------
-
-        save_binary(
-            prediction,
-            sample_dir / "prediction_binary.png",
-        )
-
-        # -------------------------------------------------------------
-        # 4. GT vs Prediction comparison
-        # -------------------------------------------------------------
-
-        comparison = make_comparison(
-            gt,
-            prediction,
-        )
-
-        Image.fromarray(
-            comparison,
-            mode="RGB",
-        ).save(
-            sample_dir / "comparison.png"
-        )
-
-        # -------------------------------------------------------------
-        # 5. Metrics for this frame
-        # -------------------------------------------------------------
-
-        frame_metrics = calculate_metrics(
-            gt,
-            prediction,
-        )
-
-        with open(
-            sample_dir / "metrics.txt",
-            "w",
-        ) as f:
-
-            f.write(
-                f"Sample: {sample['sample_index']}\n"
-            )
-
-            f.write(
-                f"Threshold: {threshold:.2f}\n\n"
-            )
-
-            for key, value in frame_metrics.items():
-                f.write(
-                    f"{key}: {value}\n"
-                )
+        with open(sample_dir / "metrics.txt", "w") as f:
+            f.write(f"Sample: {sample['sample_index']}\n")
+            f.write(f"Threshold: {threshold:.2f}\n\n")
+            for key, value in metrics.items():
+                f.write(f"{key}: {value}\n")
 
 
 # -------------------------------------------------------------------------
@@ -593,88 +456,43 @@ def save_visualizations(
 # -------------------------------------------------------------------------
 
 def parse_args():
-
     parser = argparse.ArgumentParser(
         description=(
-            "Visualize EVIMO2 Ground Truth versus "
-            "the exact V2 model prediction used "
-            "for F1/IoU."
+            "Visualize EVIMO2 Ground Truth versus the exact V2 model "
+            "prediction used for F1/IoU."
         )
     )
 
-    parser.add_argument(
-        "--dataset-root",
-        type=str,
-        required=True,
-        help="Path to EVIMO2 dataset root.",
-    )
-
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to trained V2 checkpoint.",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="./gt_vs_prediction",
-        help="Directory for visualization output.",
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-    )
-
-    parser.add_argument(
-        "--num-images",
-        type=int,
-        default=12,
-        help="Number of frames to visualize.",
-    )
-
-    parser.add_argument(
-        "--sensors",
-        nargs="+",
-        default=["left_camera"],
-    )
-
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="train",
-    )
-
-    parser.add_argument(
-        "--overfit",
-        action="store_true",
-        help="Use the project's overfit dataset behavior.",
-    )
-
-    parser.add_argument(
-        "--no-ema",
-        action="store_true",
-        help="Evaluate current model instead of EMA weights.",
-    )
+    parser.add_argument("--dataset-root", type=str, required=True,
+                         help="Path to EVIMO2 dataset root.")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                         help="Path to trained V2 checkpoint.")
+    parser.add_argument("--output-dir", type=str, default="./gt_vs_prediction",
+                         help="Directory for visualization output.")
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-images", type=int, default=12,
+                         help="Number of frames to visualize.")
+    parser.add_argument("--sensors", nargs="+", default=["left_camera"])
+    parser.add_argument("--num-workers", type=int, default=4,
+                         help="Number of dataloader worker processes.")
+    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--overfit", action="store_true",
+                         help="Use the project's overfit dataset behavior.")
+    parser.add_argument("--no-ema", action="store_true",
+                         help="Evaluate current model instead of EMA weights.")
+    parser.add_argument("--max-batches", type=int, default=None,
+                         help="Optional cap on number of batches to run "
+                              "(useful for a quick sanity check).")
 
     return parser.parse_args()
 
 
-# -------------------------------------------------------------------------
-# Entry point
-# -------------------------------------------------------------------------
-
 def main():
-
     args = parse_args()
 
     print("=" * 70)
     print("EVIMO2 — GROUND TRUTH vs MODEL PREDICTION")
     print("=" * 70)
-
     print()
     print("Dataset root :", args.dataset_root)
     print("Checkpoint   :", args.checkpoint)
@@ -682,84 +500,90 @@ def main():
     print("Thresholds   :", THRESHOLDS)
     print()
 
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
-    # -----------------------------------------------------------------
-    # Build TrainerConfig using the project's existing configuration.
-    # -----------------------------------------------------------------
-
-    cfg = TrainerConfig(
+    cfg = TrainConfigV2(
         dataset_root=args.dataset_root,
-        sensors=args.sensors,
+        sensors=tuple(args.sensors),
         split=args.split,
         batch_size=args.batch_size,
-        device=device,
+        num_workers=args.num_workers,
+        overfit_mode=args.overfit,
         use_ema=not args.no_ema,
     )
 
-    # -----------------------------------------------------------------
-    # Create trainer.
-    # -----------------------------------------------------------------
-
     trainer = TrainerV2(cfg)
-
-    # -----------------------------------------------------------------
-    # Load checkpoint.
-    # -----------------------------------------------------------------
 
     print()
     print("Loading checkpoint...")
+    checkpoint = torch.load(args.checkpoint, map_location=device)
 
-    checkpoint = torch.load(
-        args.checkpoint,
-        map_location=device,
-    )
-
-    if "model" in checkpoint:
-        trainer.model.load_state_dict(
-            checkpoint["model"],
-            strict=False,
-        )
-
+    # trainer_v2.py's _save() writes:
+    #   {"epoch": ..., "model_state_dict": ..., "optimizer_state_dict": ...}
+    # Check that key FIRST — the previous version of this script checked
+    # for "model"/"state_dict" instead, matched neither, and silently
+    # fell back to loading the checkpoint's raw dict as if it were a
+    # state_dict (with strict=False swallowing the mismatch). That left
+    # the model at its random initial weights while still "succeeding",
+    # which is why IoU came out near 0 instead of matching training.
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "model" in checkpoint:
+        state_dict = checkpoint["model"]
     elif "state_dict" in checkpoint:
-        trainer.model.load_state_dict(
-            checkpoint["state_dict"],
-            strict=False,
-        )
-
+        state_dict = checkpoint["state_dict"]
     else:
-        trainer.model.load_state_dict(
-            checkpoint,
-            strict=False,
-        )
+        state_dict = checkpoint
+
+    load_result = trainer.model.load_state_dict(state_dict, strict=False)
+
+    if load_result.missing_keys:
+        print(f"  WARNING: {len(load_result.missing_keys)} missing keys "
+              f"(model parameters that were NOT loaded from the checkpoint):")
+        for k in load_result.missing_keys[:10]:
+            print(f"    - {k}")
+        if len(load_result.missing_keys) > 10:
+            print(f"    ... and {len(load_result.missing_keys) - 10} more")
+
+    if load_result.unexpected_keys:
+        print(f"  WARNING: {len(load_result.unexpected_keys)} unexpected keys "
+              f"(checkpoint entries that did NOT match any model parameter):")
+        for k in load_result.unexpected_keys[:10]:
+            print(f"    - {k}")
+        if len(load_result.unexpected_keys) > 10:
+            print(f"    ... and {len(load_result.unexpected_keys) - 10} more")
+
+    if not load_result.missing_keys and not load_result.unexpected_keys:
+        print("  All checkpoint weights matched model parameters exactly.")
+    else:
+        n_model_params = len(list(trainer.model.state_dict().keys()))
+        n_loaded = n_model_params - len(load_result.missing_keys)
+        print(f"  Loaded {n_loaded}/{n_model_params} parameter tensors. "
+              f"If this is far below {n_model_params}, the checkpoint is "
+              f"NOT being applied correctly — treat downstream metrics "
+              f"as untrustworthy until this is fixed.")
 
     trainer.model.to(device)
     trainer.model.eval()
-
     print("Checkpoint loaded.")
 
-    # -----------------------------------------------------------------
-    # Build data loader.
-    # -----------------------------------------------------------------
-
     print()
-    print("Building EVIMO2 dataloader...")
+    print("Using EVIMO2 dataloader built by TrainerV2...")
 
-    loader = trainer._build_dataloader(
-        train=True
-    )
+    # TrainerV2.__init__ already calls self._build_dataloaders(), which
+    # sets self.train_loader / self.val_loader as attributes.
+    if args.split == "val":
+        if trainer.val_loader is None:
+            raise RuntimeError(
+                "No validation loader was built (val split may be empty "
+                "or overfit_mode is enabled). Use --split train instead."
+            )
+        loader = trainer.val_loader
+    else:
+        loader = trainer.train_loader
 
-    print("Dataloader ready.")
-
-    # -----------------------------------------------------------------
-    # Collect EXACT predictions.
-    # -----------------------------------------------------------------
+    print(f"Dataloader ready ({len(loader)} batches).")
 
     print()
     print("Running model...")
@@ -768,35 +592,22 @@ def main():
     print("    sigmoid(model_output['mask'])")
     print()
 
-    samples = collect_predictions(
-        trainer,
-        loader,
-    )
+    samples = collect_predictions(trainer, loader, max_batches=args.max_batches)
 
     if len(samples) == 0:
         raise RuntimeError(
             "No valid EVIMO2 samples with Ground Truth masks were found."
         )
 
-    print(
-        f"Collected {len(samples)} valid samples."
-    )
+    print(f"Collected {len(samples)} valid samples.")
 
-    # -----------------------------------------------------------------
-    # Find best threshold.
-    # -----------------------------------------------------------------
-
-    best, all_results = find_best_threshold(
-        samples
-    )
+    best, all_results = find_best_threshold(samples)
 
     print()
     print("=" * 70)
     print("THRESHOLD RESULTS")
     print("=" * 70)
-
     for result in all_results:
-
         print(
             f"Threshold {result['threshold']:.2f} | "
             f"IoU {result['iou']:.4f} | "
@@ -806,110 +617,49 @@ def main():
         )
 
     print()
-    print(
-        f"BEST THRESHOLD: {best['threshold']:.2f}"
-    )
-
-    print(
-        f"BEST IoU      : {best['iou']:.4f}"
-    )
-
-    print(
-        f"BEST F1       : {best['f1']:.4f}"
-    )
-
-    # -----------------------------------------------------------------
-    # Save visualizations.
-    # -----------------------------------------------------------------
+    print(f"BEST THRESHOLD: {best['threshold']:.2f}")
+    print(f"BEST IoU      : {best['iou']:.4f}")
+    print(f"BEST F1       : {best['f1']:.4f}")
 
     print()
     print("Saving visualizations...")
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     save_visualizations(
         samples=samples,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         threshold=best["threshold"],
         max_images=args.num_images,
     )
 
-    # -----------------------------------------------------------------
-    # Save global metrics.
-    # -----------------------------------------------------------------
+    plot_threshold_sweep(all_results, output_dir)
 
-    metrics_path = (
-        Path(args.output_dir)
-        / "metrics.txt"
-    )
-
+    metrics_path = output_dir / "metrics.txt"
     with open(metrics_path, "w") as f:
-
-        f.write(
-            "EVIMO2 Ground Truth vs Prediction\n"
-        )
-
-        f.write(
-            "=================================\n\n"
-        )
-
-        f.write(
-            "Prediction:\n"
-        )
-
-        f.write(
-            "sigmoid(model_output['mask'])\n\n"
-        )
-
-        f.write(
-            "Thresholds:\n"
-        )
-
-        f.write(
-            f"{THRESHOLDS}\n\n"
-        )
-
-        f.write(
-            f"Best threshold: "
-            f"{best['threshold']:.4f}\n"
-        )
-
-        f.write(
-            f"Best IoU: "
-            f"{best['iou']:.6f}\n"
-        )
-
-        f.write(
-            f"Best F1: "
-            f"{best['f1']:.6f}\n"
-        )
-
-        f.write(
-            f"Best precision: "
-            f"{best['precision']:.6f}\n"
-        )
-
-        f.write(
-            f"Best recall: "
-            f"{best['recall']:.6f}\n"
-        )
+        f.write("EVIMO2 Ground Truth vs Prediction\n")
+        f.write("=================================\n\n")
+        f.write("Prediction:\n")
+        f.write("sigmoid(model_output['mask'])\n\n")
+        f.write("Thresholds:\n")
+        f.write(f"{THRESHOLDS}\n\n")
+        f.write(f"Best threshold: {best['threshold']:.4f}\n")
+        f.write(f"Best IoU: {best['iou']:.6f}\n")
+        f.write(f"Best F1: {best['f1']:.6f}\n")
+        f.write(f"Best precision: {best['precision']:.6f}\n")
+        f.write(f"Best recall: {best['recall']:.6f}\n")
 
     print()
     print("=" * 70)
     print("DONE")
     print("=" * 70)
-
     print()
-    print(
-        "Visualizations saved to:"
-    )
-
-    print(
-        Path(args.output_dir).resolve()
-    )
-
+    print("Visualizations saved to:", output_dir.resolve())
     print()
-    print(
-        "Open comparison.png inside each sample directory."
-    )
+    print("Open comparison.png inside each sample_XXXX folder — that is")
+    print("the single image showing input / ground truth / prediction /")
+    print("overlay side by side.")
 
 
 if __name__ == "__main__":
