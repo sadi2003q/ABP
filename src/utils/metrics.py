@@ -158,6 +158,95 @@ def evimo2_mask_to_binary_dynamic(
 
 
 # Legacy alias (kept for backward compat with code that may still call it)
+def get_dynamic_object_ids_silhouette_filtered(
+    frame_motion,
+    current_mask,
+    previous_mask,
+    self_iou_threshold: float = 0.85,
+) -> set[int]:
+    """
+    Stricter version of get_dynamic_object_ids().
+
+    An object counts as "dynamic" only if BOTH are true:
+        1. Its 3D speed exceeds MOTION_THRESHOLD_SPEED (the original
+           criterion), AND
+        2. Its 2D silhouette actually changed between this frame and
+           the previous frame (self-IoU <= self_iou_threshold).
+
+    This exists because EVIMO2's 3D-speed-only criterion can flag an
+    object as "dynamic" purely from pose noise/jitter even when it is
+    visibly stationary on screen (silhouette self-IoU close to 1.0).
+    That inflates GT dynamic-mask coverage with objects that never
+    actually moved in the image. See diagnose_dynamic_mask.py, which
+    uses this same self-IoU test to flag "suspect" frames.
+
+    This function is ADDITIVE — it does not change
+    get_dynamic_object_ids() or evimo2_mask_to_binary_dynamic(), and
+    is not called anywhere in trainer.py / trainer_v2.py. It is meant
+    for exploration/evaluation scripts that want a stricter GT
+    definition without touching the training pipeline.
+
+    Parameters
+    ----------
+    frame_motion : FrameMotion or None
+        Same as get_dynamic_object_ids().
+    current_mask, previous_mask : np.ndarray or torch.Tensor or None
+        Raw EVIMO2 instance masks (object_id * 1000 encoding) for the
+        current frame and the immediately preceding frame. Shape
+        (H, W) or (1, H, W). If previous_mask is None (e.g. this is
+        the sequence's first frame), every speed-flagged object is
+        kept as-is (nothing to compare against, so we don't discard
+        it) — matches the diagnostic script's "no previous frame"
+        behavior.
+    self_iou_threshold : float
+        Objects with silhouette self-IoU ABOVE this value are treated
+        as not visibly moving and dropped from the dynamic set.
+        Matches diagnose_dynamic_mask.py's default.
+
+    Returns
+    -------
+    set of int
+        Object IDs that are moving AND visibly changed silhouette.
+    """
+    speed_dynamic_ids = get_dynamic_object_ids(frame_motion)
+
+    if not speed_dynamic_ids or previous_mask is None:
+        return speed_dynamic_ids
+
+    def to_numpy(m):
+        if m is None:
+            return None
+        if isinstance(m, torch.Tensor):
+            m = m.detach().cpu().numpy()
+        m = np.asarray(m)
+        return m.squeeze()
+
+    current_mask = to_numpy(current_mask)
+    previous_mask = to_numpy(previous_mask)
+
+    kept_ids = set()
+
+    for object_id in speed_dynamic_ids:
+        current_obj = (current_mask // 1000) == object_id
+        previous_obj = (previous_mask // 1000) == object_id
+
+        union = np.logical_or(current_obj, previous_obj).sum()
+        if union == 0:
+            # Object not visible in either frame — nothing to judge,
+            # keep the speed-based verdict rather than silently drop it.
+            kept_ids.add(object_id)
+            continue
+
+        self_iou = np.logical_and(current_obj, previous_obj).sum() / union
+
+        if self_iou <= self_iou_threshold:
+            kept_ids.add(object_id)
+        # else: silhouette barely changed despite passing the speed
+        # threshold -> likely pose jitter, not real motion. Dropped.
+
+    return kept_ids
+
+
 def evimo2_mask_to_binary(mask) -> torch.Tensor:
     """Legacy: convert mask to binary treating ALL objects as dynamic.
     Prefer evimo2_mask_to_binary_dynamic() with dynamic_object_ids.
