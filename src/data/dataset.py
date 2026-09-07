@@ -86,6 +86,7 @@ class EVIMO2Dataset(Dataset):
         load_depth: bool = True,
         load_mask: bool = True,
         subset: str = "imo",
+        sequence: str | list[str] | tuple[str, ...] | None = None,
     ):
 
         super().__init__()
@@ -102,6 +103,7 @@ class EVIMO2Dataset(Dataset):
             sensors=sensors,
             split=split,
             subset=subset,
+            sequence=sequence,
         )
 
         #

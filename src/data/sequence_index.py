@@ -122,27 +122,31 @@ class SequenceIndex:
         sensors: tuple[str, ...] | list[str] | None = None,
         split: str = "train",
         subset: str = "imo",
+        sequence: str | list[str] | tuple[str, ...] | None = None,
     ):
 
         self.dataset_root = Path(dataset_root).expanduser()
-
-        self.sensors = tuple(
-            sensors
-            if sensors is not None
-            else DEFAULT_EVENT_SENSORS
-        )
-
+        self.sensors = tuple(sensors if sensors is not None else DEFAULT_EVENT_SENSORS)
         self.split = split
         self.subset = subset
 
-        self.sequences: list[SequenceInfo] = (
-            self._discover_sequences()
-        )
+        if sequence is None:
+            self.sequence_filter = None
+        elif isinstance(sequence, str):
+            self.sequence_filter = {sequence}
+        else:
+            self.sequence_filter = set(sequence)
 
-        self.references: list[SequenceReference] = (
-            self._build_sample_index()
-        )
+        self.sequences = self._discover_sequences()
 
+        if self.sequence_filter is not None and not self.sequences:
+            raise ValueError(
+                f"No sequences matched sequence filter {sorted(self.sequence_filter)!r} "
+                f"under {self.dataset_root} (sensors={self.sensors}, "
+                f"subset={self.subset!r}, split={self.split!r})."
+            )
+
+        self.references = self._build_sample_index()
         self._print_summary()
 
     # ======================================================
@@ -186,6 +190,13 @@ class SequenceIndex:
             for sequence_dir in sorted(split_root.iterdir()):
 
                 if not sequence_dir.is_dir():
+                    continue
+
+
+                if (
+                    self.sequence_filter is not None
+                    and sequence_dir.name not in self.sequence_filter
+                ):
                     continue
 
                 if not (

@@ -13,6 +13,11 @@ def main():
     p.add_argument("--subset", type=str, default="imo",
                      help="Subset folder name under each sensor, e.g. "
                           "'imo', 'imo_II', 'sanity', 'sanity_II', 'sfm', 'sfm_II'.")
+    p.add_argument("--sequence", type=str, nargs="+", default=None,
+                     help="Optional sequence name(s) (the sequence directory "
+                          "name under <sensor>/<subset>/<split>/) to restrict "
+                          "training to. If omitted, all sequences found under "
+                          "that folder are used.")
     p.add_argument("--val-split", type=str, default="val")
     p.add_argument("--history-offsets", type=int, nargs="+", default=[-12, -8, -4, 0])
     p.add_argument("--num-bins", type=int, default=5)
@@ -78,6 +83,7 @@ def main():
         eval_every_n_epochs=args.eval_every_n_epochs,
         checkpoint_every_n_epochs=args.checkpoint_every_n_epochs,
         subset=args.subset,
+        sequence=tuple(args.sequence) if args.sequence else None,
         seed=args.seed, overfit_mode=args.overfit, gt_mask_sanity=args.gt_mask_sanity,
     )
 
