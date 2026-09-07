@@ -479,6 +479,11 @@ def parse_args():
     parser.add_argument("--subset", type=str, default="imo",
                      help="Subset folder name under each sensor, e.g. "
                           "'imo', 'imo_II', 'sanity', 'sanity_II', 'sfm', 'sfm_II'.")
+    parser.add_argument("--sequence", type=str, nargs="+", default=None,
+                         help="Optional sequence name(s) (the sequence directory "
+                              "name under <sensor>/<subset>/<split>/) to restrict "
+                              "visualization to. If omitted, all sequences found "
+                              "under that folder are used, same as before.")
     parser.add_argument("--overfit", action="store_true",
                          help="Use the project's overfit dataset behavior.")
     parser.add_argument("--no-ema", action="store_true",
@@ -500,6 +505,7 @@ def main():
     print("Dataset root :", args.dataset_root)
     print("Checkpoint   :", args.checkpoint)
     print("Output       :", args.output_dir)
+    print("Sequence     :", args.sequence if args.sequence else "(all sequences in split)")
     print("Thresholds   :", THRESHOLDS)
     print()
 
@@ -511,6 +517,7 @@ def main():
         sensors=tuple(args.sensors),
         split=args.split,
         subset=args.subset,
+        sequence=tuple(args.sequence) if args.sequence else None,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         overfit_mode=args.overfit,
