@@ -13,12 +13,22 @@ This tool is intended for debugging the complete data pipeline.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 import argparse
 
 import cv2
 import numpy as np
 from tqdm import tqdm
+
+# This file lives at <project_root>/tools/visualization/, two levels
+# below the project root where `src/` sits. Without this, running it
+# as `python tools/visualization/dataset_verification.py` fails with
+# "ModuleNotFoundError: No module named 'src'", because Python only
+# adds the SCRIPT's own directory to sys.path, not the project root.
+# (train_v2.py and other root-level scripts don't need this because
+# they already sit next to `src/`.)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.dataset import EVIMO2Dataset
 
@@ -671,11 +681,21 @@ def main():
         help="Only generate one sequence.",
     )
 
+    parser.add_argument(
+        "--sensors",
+        nargs="+",
+        default=["left_camera"],
+        help="Sensors to include (default: left_camera only). "
+             "Pass e.g. --sensors left_camera right_camera samsung_mono "
+             "for more.",
+    )
+
     args = parser.parse_args()
 
     dataset = EVIMO2Dataset(
         dataset_root=args.dataset_root,
         split=args.split,
+        sensors=args.sensors,
     )
 
     sequence_map = build_sequence_index(dataset)

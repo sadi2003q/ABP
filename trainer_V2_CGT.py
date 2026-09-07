@@ -170,6 +170,20 @@ class TrainerV2:
         )
         self.train_dataset = ds
         self._corrected_gt_cache = {}  # sequence_name -> {frame_id: [ids]}
+
+        if self.cfg.use_corrected_gt:
+            logger.info(
+                "use_corrected_gt=True: training loss will use "
+                "silhouette-filtered dynamic GT from "
+                "cache/corrected_dynamic_ids.npz per sequence "
+                "(falls back to original GT + WARNING per sequence "
+                "if that cache file is missing)."
+            )
+        else:
+            logger.info(
+                "use_corrected_gt=False: training loss uses the "
+                "original speed-only dynamic GT (default behavior)."
+            )
         tds = TemporalEVIMO2Dataset(ds, history_offsets=self.cfg.history_offsets)
         logger.info(f"Train: {len(tds)} windows")
         self.train_loader = DataLoader(
@@ -236,6 +250,50 @@ class TrainerV2:
         if cache is None:
             return None
         return set(cache.get(int(frame_id), []))
+
+    def _corrected_frame_motions(self, frame_motions, sequence_names, frame_ids):
+        """
+        Build a list of FrameMotion-like objects whose .speed values are
+        rigged so that get_dynamic_object_ids() (called internally by
+        SegmentationMetrics.update()) returns the CORRECTED,
+        silhouette-filtered dynamic object set instead of the original
+        speed-only set — without modifying metrics.py.
+
+        For each object id in the corrected set, speed is set above
+        MOTION_THRESHOLD_SPEED; every other id keeps a speed of 0.
+        This is evaluation-only plumbing: it does not touch the
+        original FrameMotion objects or any cached file.
+        """
+        from src.data.sample import FrameMotion
+        from src.utils.metrics import MOTION_THRESHOLD_SPEED
+
+        rigged = []
+        for fm, seq_name, fid in zip(frame_motions, sequence_names, frame_ids):
+            if fm is None:
+                rigged.append(None)
+                continue
+
+            corrected_ids = self._get_corrected_dynamic_ids(seq_name, fid)
+            if corrected_ids is None:
+                # Cache missing for this sequence -- already warned once
+                # in _get_corrected_dynamic_ids. Fall back to the
+                # original, unmodified frame_motion.
+                rigged.append(fm)
+                continue
+
+            object_ids = np.asarray(fm.object_ids)
+            speed = np.array(
+                [MOTION_THRESHOLD_SPEED * 2.0 if int(oid) in corrected_ids else 0.0
+                 for oid in object_ids],
+                dtype=np.float32,
+            )
+            rigged.append(FrameMotion(
+                object_ids=object_ids,
+                delta_position=fm.delta_position,
+                speed=speed,
+            ))
+
+        return rigged
 
     def _build_gt_dynamic_mask(self, raw_batch, target_hw):
         """Build speed-aware binary EVIMO dynamic GT masks for valid samples."""
@@ -474,6 +532,12 @@ class TrainerV2:
             probs = torch.sigmoid(out["mask"])
             gts = raw.frames[-1].mask
             fms = raw.frames[-1].frame_motion
+
+            if self.cfg.use_corrected_gt:
+                fms = self._corrected_frame_motions(
+                    fms, raw.frames[-1].sequence_names, raw.frames[-1].frame_ids
+                )
+
             valid = [(p, g, fm) for p, g, fm in zip(probs, gts, fms) if g is not None]
             if not valid: continue
             vp = torch.stack([p for p, _, _ in valid])
