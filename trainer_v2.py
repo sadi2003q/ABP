@@ -14,6 +14,7 @@ import os, time, math, logging
 from pathlib import Path
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,8 +33,6 @@ class TrainConfigV2:
     dataset_root: str = "/home/z/my-project/data/dataset_root"
     sensors: tuple = ("left_camera",)
     split: str = "train"
-    subset: str = "imo" 
-    sequence: tuple | None = None
     val_split: str = "val"
     history_offsets: tuple = (-12, -8, -4, 0)
     num_bins: int = 5
@@ -69,6 +68,16 @@ class TrainConfigV2:
     overfit_mode: bool = False
     gt_mask_sanity: bool = False
     resume_from: str | None = None
+    use_corrected_gt: bool = False
+    """
+    If True, GT dynamic masks are filtered using the precomputed
+    silhouette-filtered object IDs in
+    <sequence_dir>/cache/corrected_dynamic_ids.npz (see
+    precompute_corrected_gt.py), instead of the original
+    speed-only definition. Requires running precompute_corrected_gt.py
+    on every sequence first. Defaults to False so existing behavior
+    and all past runs are completely unaffected.
+    """
 
 
 class EMA:
@@ -158,9 +167,23 @@ class TrainerV2:
             dataset_root=self.cfg.dataset_root,
             sensors=self.cfg.sensors, split=self.cfg.split,
             load_depth=True, load_mask=True,
-            subset=self.cfg.subset,
-            sequence=self.cfg.sequence
         )
+        self.train_dataset = ds
+        self._corrected_gt_cache = {}  # sequence_name -> {frame_id: [ids]}
+
+        if self.cfg.use_corrected_gt:
+            logger.info(
+                "use_corrected_gt=True: training loss will use "
+                "silhouette-filtered dynamic GT from "
+                "cache/corrected_dynamic_ids.npz per sequence "
+                "(falls back to original GT + WARNING per sequence "
+                "if that cache file is missing)."
+            )
+        else:
+            logger.info(
+                "use_corrected_gt=False: training loss uses the "
+                "original speed-only dynamic GT (default behavior)."
+            )
         tds = TemporalEVIMO2Dataset(ds, history_offsets=self.cfg.history_offsets)
         logger.info(f"Train: {len(tds)} windows")
         self.train_loader = DataLoader(
@@ -175,7 +198,6 @@ class TrainerV2:
                     dataset_root=self.cfg.dataset_root,
                     sensors=self.cfg.sensors, split=self.cfg.val_split,
                     load_depth=True, load_mask=True,
-                    subset=self.cfg.subset
                 )
                 vtds = TemporalEVIMO2Dataset(vds, history_offsets=self.cfg.history_offsets)
                 self.val_loader = DataLoader(
@@ -191,6 +213,88 @@ class TrainerV2:
             VoxelizeEvents(num_bins=self.cfg.num_bins),
         ])
 
+    def _get_corrected_dynamic_ids(self, sequence_name, frame_id):
+        """
+        Look up the precomputed silhouette-filtered dynamic object IDs
+        for one (sequence_name, frame_id), loading and caching each
+        sequence's cache/corrected_dynamic_ids.npz on first use.
+
+        Returns None if the cache file doesn't exist for this sequence
+        (caller should fall back to the original speed-only GT with a
+        warning, rather than silently training on nothing).
+        """
+        if sequence_name not in self._corrected_gt_cache:
+            sequence_dir = None
+            for seq in self.train_dataset.index.sequences:
+                if seq.sequence_name == sequence_name:
+                    sequence_dir = seq.sequence_dir
+                    break
+
+            if sequence_dir is None:
+                self._corrected_gt_cache[sequence_name] = None
+            else:
+                cache_path = Path(sequence_dir) / "cache" / "corrected_dynamic_ids.npz"
+                if not cache_path.exists():
+                    logger.warning(
+                        "use_corrected_gt=True but %s does not exist. "
+                        "Run precompute_corrected_gt.py on this sequence first. "
+                        "Falling back to original speed-only GT for sequence '%s'.",
+                        cache_path, sequence_name,
+                    )
+                    self._corrected_gt_cache[sequence_name] = None
+                else:
+                    data = np.load(cache_path, allow_pickle=True)
+                    self._corrected_gt_cache[sequence_name] = data["corrected_dynamic_ids"].item()
+
+        cache = self._corrected_gt_cache[sequence_name]
+        if cache is None:
+            return None
+        return set(cache.get(int(frame_id), []))
+
+    def _corrected_frame_motions(self, frame_motions, sequence_names, frame_ids):
+        """
+        Build a list of FrameMotion-like objects whose .speed values are
+        rigged so that get_dynamic_object_ids() (called internally by
+        SegmentationMetrics.update()) returns the CORRECTED,
+        silhouette-filtered dynamic object set instead of the original
+        speed-only set — without modifying metrics.py.
+
+        For each object id in the corrected set, speed is set above
+        MOTION_THRESHOLD_SPEED; every other id keeps a speed of 0.
+        This is evaluation-only plumbing: it does not touch the
+        original FrameMotion objects or any cached file.
+        """
+        from src.data.sample import FrameMotion
+        from src.utils.metrics import MOTION_THRESHOLD_SPEED
+
+        rigged = []
+        for fm, seq_name, fid in zip(frame_motions, sequence_names, frame_ids):
+            if fm is None:
+                rigged.append(None)
+                continue
+
+            corrected_ids = self._get_corrected_dynamic_ids(seq_name, fid)
+            if corrected_ids is None:
+                # Cache missing for this sequence -- already warned once
+                # in _get_corrected_dynamic_ids. Fall back to the
+                # original, unmodified frame_motion.
+                rigged.append(fm)
+                continue
+
+            object_ids = np.asarray(fm.object_ids)
+            speed = np.array(
+                [MOTION_THRESHOLD_SPEED * 2.0 if int(oid) in corrected_ids else 0.0
+                 for oid in object_ids],
+                dtype=np.float32,
+            )
+            rigged.append(FrameMotion(
+                object_ids=object_ids,
+                delta_position=fm.delta_position,
+                speed=speed,
+            ))
+
+        return rigged
+
     def _build_gt_dynamic_mask(self, raw_batch, target_hw):
         """Build speed-aware binary EVIMO dynamic GT masks for valid samples."""
         from src.utils.metrics import (
@@ -201,6 +305,8 @@ class TrainerV2:
         last_frame = raw_batch.frames[-1]
         gt_masks = last_frame.mask
         frame_motions = last_frame.frame_motion
+        sequence_names = last_frame.sequence_names
+        frame_ids = last_frame.frame_ids
 
         gt_batch = []
         valid_indices = []
@@ -210,6 +316,16 @@ class TrainerV2:
                 continue
 
             dynamic_ids = get_dynamic_object_ids(frame_motion)
+
+            if self.cfg.use_corrected_gt:
+                corrected = self._get_corrected_dynamic_ids(
+                    sequence_names[i], frame_ids[i]
+                )
+                if corrected is not None:
+                    dynamic_ids = corrected
+                # else: cache missing for this sequence, already warned
+                # once above -- fall back to the original speed-only ids.
+
             gt = evimo2_mask_to_binary_dynamic(gt_raw, dynamic_ids)
 
             while gt.ndim > 2:
@@ -329,7 +445,7 @@ class TrainerV2:
         self.writer.add_scalar("train/total_loss", total_loss.item(), gs)
         for k in ["photometric_loss", "depth_smoothness_loss", "pose_temporal_loss",
                    "sparsity_loss", "dynamic_ratio", "depth_diversity",
-                   "depth_diversity_loss"]:
+                   "depth_diversity_loss", "pseudo_mask_mean", "pseudo_mask_nonzero_frac"]:
             if k in lo:
                 v = lo[k]
                 if isinstance(v, torch.Tensor) and v.dim() == 0:
@@ -359,6 +475,8 @@ class TrainerV2:
                     f"ds={lo.get('depth_smoothness_loss', torch.tensor(0)).item():.4f} | "
                     f"dvar={dd_val:.3f} | "
                     f"dr={lo.get('dynamic_ratio', torch.tensor(0)).item():.3f} | "
+                    f"pmask_mean={lo.get('pseudo_mask_mean', torch.tensor(0)).item():.4f} | "
+                    f"pmask_nz={lo.get('pseudo_mask_nonzero_frac', torch.tensor(0)).item():.3f} | "
                     f"gn={gn.item():.2f}"
                 )
 
@@ -416,6 +534,12 @@ class TrainerV2:
             probs = torch.sigmoid(out["mask"])
             gts = raw.frames[-1].mask
             fms = raw.frames[-1].frame_motion
+
+            if self.cfg.use_corrected_gt:
+                fms = self._corrected_frame_motions(
+                    fms, raw.frames[-1].sequence_names, raw.frames[-1].frame_ids
+                )
+
             valid = [(p, g, fm) for p, g, fm in zip(probs, gts, fms) if g is not None]
             if not valid: continue
             vp = torch.stack([p for p, _, _ in valid])

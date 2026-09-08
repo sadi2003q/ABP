@@ -124,6 +124,8 @@ class TotalLossV2(nn.Module):
         # strong enough to prevent mask expansion.
         residual_mask_loss = torch.tensor(0.0, device=device)
         weighted_residual_mask_loss = residual_mask_loss
+        pseudo_mask_mean = torch.tensor(0.0, device=device)
+        pseudo_mask_nonzero_frac = torch.tensor(0.0, device=device)
         residual = outputs.get("residual")
 
         if residual is not None:
@@ -144,6 +146,16 @@ class TotalLossV2(nn.Module):
             weighted_residual_mask_loss = (
                 self.residual_mask_weight * residual_mask_loss
             )
+
+            # Diagnostics: is the residual pseudo-label itself
+            # collapsing to near-zero (e.g. because depth/pose
+            # haven't converged enough for the 1.5x-median threshold
+            # in model_v2.py to pass any pixels)? If pseudo_mask_mean
+            # tracks target_dynamic_ratio (0.05) closely and stays
+            # flat across epochs, the mask head has nothing real to
+            # learn from and is just matching the sparsity prior.
+            pseudo_mask_mean = pseudo_mask.mean().detach()
+            pseudo_mask_nonzero_frac = (pseudo_mask > 0).float().mean().detach()
 
         # === Total ===
         total_loss = (
@@ -169,6 +181,8 @@ class TotalLossV2(nn.Module):
             "weighted_sparsity_loss": sparsity_loss,
             "residual_mask_loss": residual_mask_loss,
             "weighted_residual_mask_loss": weighted_residual_mask_loss,
+            "pseudo_mask_mean": pseudo_mask_mean,
+            "pseudo_mask_nonzero_frac": pseudo_mask_nonzero_frac,
             "dynamic_ratio": dynamic_mask["dynamic_ratio"],
             "mask_probs": outputs.get("mask_probs"),
         }
