@@ -676,9 +676,20 @@ def main():
     )
 
     parser.add_argument(
+    "--subset",
+    default="imo",
+    help="Subset folder name under each sensor, e.g. "
+            "'imo', 'imo_II', 'sanity', 'sanity_II', 'sfm', 'sfm_II'.",
+    )
+
+    parser.add_argument(
         "--sequence",
+        nargs="+",
         default=None,
-        help="Only generate one sequence.",
+        help="Only generate video(s) for this sequence name (or names). "
+             "If omitted, every sequence found under "
+             "<sensor>/<subset>/<split>/ gets its own video, same as "
+             "before.",
     )
 
     parser.add_argument(
@@ -696,17 +707,19 @@ def main():
         dataset_root=args.dataset_root,
         split=args.split,
         sensors=args.sensors,
+        subset=args.subset,
+        sequence=args.sequence,
     )
 
     sequence_map = build_sequence_index(dataset)
 
     for (sensor, sequence_name), indices in sequence_map.items():
 
-        if (
-            args.sequence is not None
-            and sequence_name != args.sequence
-        ):
-            continue
+        # if (
+        #     args.sequence is not None
+        #     and sequence_name != args.sequence
+        # ):
+        #     continue
 
         output = (
             args.output
