@@ -1,4 +1,5 @@
 """
+src/model/modelv2.py
 World Model v2 — Direct Residual Mask.
 
 Simplified architecture that directly computes the motion mask from
@@ -139,7 +140,7 @@ class WorldModelV2(nn.Module):
         if isinstance(mask_final, nn.Conv2d):
             nn.init.constant_(mask_final.bias, -3.0)
 
-    def forward(self, voxel_batch: torch.Tensor, batch, gt_depths: torch.Tensor | None = None) -> dict:
+    def forward(self, voxel_batch: torch.Tensor, batch) -> dict:
         """
         Parameters
         ----------
@@ -147,17 +148,6 @@ class WorldModelV2(nn.Module):
             Input event voxel grids.
         batch : TemporalEVIMO2Batch
             Contains IMU data, camera intrinsics, etc.
-        gt_depths : (B, T, 1, H_low, W_low) or None, optional
-            DIAGNOSTIC ONLY. If provided, overrides the *predicted*
-            depth used for warping/residual/mask with ground-truth
-            depth (already resized to the low-res feature grid this
-            model predicts depth at). The model still predicts depth
-            normally (so `depths`/`depth` in the returned dict are
-            still the model's own prediction, for logging), but the
-            residual computation — and therefore the mask — is driven
-            by `gt_depths` instead. Never pass this during normal
-            training; it exists purely to isolate whether depth/pose
-            or the mask-refinement head is the IoU bottleneck.
 
         Returns
         -------
@@ -234,14 +224,8 @@ class WorldModelV2(nn.Module):
         # === 6. Compute multi-scale photometric residual ===
         # For each pair (t-1, t), warp voxel(t-1) → t and compute residual
         # We compute at H/4 (finest scale where we have depth after upsampling)
-        #
-        # DIAGNOSTIC: if gt_depths was passed in, use it in place of the
-        # predicted `depths` for the warp/residual. `depth`/`depths` in
-        # the returned dict remain the model's own prediction so you can
-        # still compare predicted vs. GT depth directly.
-        depths_for_residual = gt_depths if gt_depths is not None else depths
         residual_full = self._compute_residual(
-            voxel_batch, depths_for_residual, poses, K_raw, distortion, H, W
+            voxel_batch, depths, poses, K_raw, distortion, H, W
         )  # (B, 1, H, W)
 
         # === 7. Refine mask from residual + encoder features ===
