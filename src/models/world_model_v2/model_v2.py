@@ -139,7 +139,13 @@ class WorldModelV2(nn.Module):
         if isinstance(mask_final, nn.Conv2d):
             nn.init.constant_(mask_final.bias, -3.0)
 
-    def forward(self, voxel_batch: torch.Tensor, batch, gt_depths: torch.Tensor | None = None) -> dict:
+    def forward(
+        self,
+        voxel_batch: torch.Tensor,
+        batch,
+        gt_depths: torch.Tensor | None = None,
+        gt_pose: torch.Tensor | None = None,
+    ) -> dict:
         """
         Parameters
         ----------
@@ -155,9 +161,18 @@ class WorldModelV2(nn.Module):
             normally (so `depths`/`depth` in the returned dict are
             still the model's own prediction, for logging), but the
             residual computation — and therefore the mask — is driven
-            by `gt_depths` instead. Never pass this during normal
-            training; it exists purely to isolate whether depth/pose
-            or the mask-refinement head is the IoU bottleneck.
+            by `gt_depths` instead.
+        gt_pose : (B, 9) or None, optional
+            DIAGNOSTIC ONLY. If provided, overrides the *predicted*
+            pose for the reference pair (t-1 -> t) used in the
+            warp/residual with a ground-truth relative pose (same
+            [tx,ty,tz, a1(3), a2(3)] 6D-rotation layout the model
+            predicts). `poses`/`pose` in the returned dict remain the
+            model's own prediction for logging.
+
+        Never pass gt_depths/gt_pose during normal training; they
+        exist purely to isolate whether depth, pose, or the
+        mask-refinement head is the IoU bottleneck.
 
         Returns
         -------
@@ -235,13 +250,18 @@ class WorldModelV2(nn.Module):
         # For each pair (t-1, t), warp voxel(t-1) → t and compute residual
         # We compute at H/4 (finest scale where we have depth after upsampling)
         #
-        # DIAGNOSTIC: if gt_depths was passed in, use it in place of the
-        # predicted `depths` for the warp/residual. `depth`/`depths` in
-        # the returned dict remain the model's own prediction so you can
-        # still compare predicted vs. GT depth directly.
+        # DIAGNOSTIC: if gt_depths/gt_pose was passed in, use it in place
+        # of the predicted `depths`/`poses[:, -1]` for the warp/residual.
+        # `depth`/`depths`/`poses`/`pose` in the returned dict remain the
+        # model's own prediction so you can still compare predicted vs.
+        # GT directly.
         depths_for_residual = gt_depths if gt_depths is not None else depths
+        poses_for_residual = poses
+        if gt_pose is not None:
+            poses_for_residual = poses.clone()
+            poses_for_residual[:, -1] = gt_pose
         residual_full = self._compute_residual(
-            voxel_batch, depths_for_residual, poses, K_raw, distortion, H, W
+            voxel_batch, depths_for_residual, poses_for_residual, K_raw, distortion, H, W
         )  # (B, 1, H, W)
 
         # === 7. Refine mask from residual + encoder features ===

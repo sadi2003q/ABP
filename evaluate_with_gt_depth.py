@@ -117,6 +117,116 @@ def build_gt_depth_tensor(raw_batch, target_hw, device):
     return stacked, valid_mask
 
 
+def quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
+    """
+    q: (B, 4) in (x, y, z, w) order (EVIMO2 convention throughout this
+    codebase). Returns (B, 3, 3) rotation matrices.
+    """
+    x, y, z, w = q.unbind(-1)
+    B = q.shape[0]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
+    R = torch.stack([
+        1 - 2 * (yy + zz),     2 * (xy - wz),     2 * (xz + wy),
+            2 * (xy + wz), 1 - 2 * (xx + zz),     2 * (yz - wx),
+            2 * (xz - wy),     2 * (yz + wx), 1 - 2 * (xx + yy),
+    ], dim=-1).reshape(B, 3, 3)
+    return R
+
+
+def rotation_matrix_to_6d(R: torch.Tensor) -> torch.Tensor:
+    """
+    (B, 3, 3) -> (B, 6) using the same convention LatentRenderer expects:
+    pose[3:6] = R[:, 0] (first COLUMN of R), pose[6:9] = R[:, 1] (second
+    column) -- see LatentRenderer.pose_to_matrix, which builds
+    R = stack([b1, b2, b3], dim=2), i.e. b1/b2 are columns of R.
+    """
+    a1 = R[:, :, 0]
+    a2 = R[:, :, 1]
+    return torch.cat([a1, a2], dim=-1)
+
+
+def build_gt_pose_tensor(raw_batch, device):
+    """
+    Build the ground-truth RELATIVE pose for the reference pair
+    (t-1 -> t) in the (B, 9) [tx,ty,tz, a1(3), a2(3)] layout
+    WorldModelV2 predicts, from the absolute camera-to-world
+    translation/quaternion in the last two frames' CameraMotion.
+
+    LatentRenderer applies T directly to points backprojected in the
+    TARGET camera's frame (using depth(t)) to sample into the SOURCE
+    image (voxel(t-1)) -- i.e. T must map camera(t) coordinates into
+    camera(t-1) coordinates (SfMLearner/Monodepth2 "T_{t-1<-t}"
+    convention). With R_w2c = R_c2w^T for a camera-to-world rotation
+    R_c2w, and p_world = R_i @ p_cam_i + t_i:
+
+        p_cam_{t-1} = R_{t-1}^T @ (R_t @ p_cam_t + t_t - t_{t-1})
+                    = (R_{t-1}^T @ R_t) @ p_cam_t + R_{t-1}^T @ (t_t - t_{t-1})
+
+    So T = [R_rel | t_rel] with:
+        R_rel = R_{t-1}^T @ R_t
+        t_rel = R_{t-1}^T @ (t_t - t_{t-1})
+
+    Returns (gt_pose, valid) where valid (B,) is False for samples
+    where either frame lacks a valid GT pose (CameraMotion.pose_available).
+    """
+    frame_prev = raw_batch.frames[-2]
+    frame_curr = raw_batch.frames[-1]
+    B = len(frame_curr.camera_motion)
+
+    t_prev = torch.stack([
+        torch.as_tensor(cm.translation, dtype=torch.float32) for cm in frame_prev.camera_motion
+    ]).to(device)
+    t_curr = torch.stack([
+        torch.as_tensor(cm.translation, dtype=torch.float32) for cm in frame_curr.camera_motion
+    ]).to(device)
+    q_prev = torch.stack([
+        torch.as_tensor(cm.quaternion, dtype=torch.float32) for cm in frame_prev.camera_motion
+    ]).to(device)
+    q_curr = torch.stack([
+        torch.as_tensor(cm.quaternion, dtype=torch.float32) for cm in frame_curr.camera_motion
+    ]).to(device)
+
+    valid = torch.tensor([
+        bool(cm_p.pose_available) and bool(cm_c.pose_available)
+        for cm_p, cm_c in zip(frame_prev.camera_motion, frame_curr.camera_motion)
+    ], device=device)
+
+    R_prev = quaternion_to_matrix(q_prev)  # (B,3,3)
+    R_curr = quaternion_to_matrix(q_curr)
+
+    R_rel = torch.bmm(R_prev.transpose(1, 2), R_curr)  # R_{t-1}^T @ R_t
+    t_rel = torch.bmm(
+        R_prev.transpose(1, 2), (t_curr - t_prev).unsqueeze(-1)
+    ).squeeze(-1)  # R_{t-1}^T @ (t_t - t_{t-1})
+
+    rot6d = rotation_matrix_to_6d(R_rel)  # (B, 6)
+    gt_pose = torch.cat([t_rel, rot6d], dim=-1)  # (B, 9)
+
+    return gt_pose, valid
+
+
+def rescale_pose_translation_to_match_predicted(gt_pose, pred_pose):
+    """
+    Crude per-sample scale correction for GT pose translation:
+    rescale ||t_gt|| to match ||t_pred|| (rotation is unaffected by
+    scale so it's left as-is). Same rationale as
+    rescale_to_match_predicted for depth: predicted pose/depth share
+    an arbitrary, jointly-learned scale that GT metric values don't
+    match, so a raw metric substitution can look artificially worse.
+    gt_pose, pred_pose: (B, 9).
+    """
+    t_gt = gt_pose[:, :3]
+    t_pred = pred_pose[:, :3]
+    gt_norm = t_gt.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    pred_norm = t_pred.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    scale = pred_norm / gt_norm
+    t_gt_scaled = t_gt * scale
+    return torch.cat([t_gt_scaled, gt_pose[:, 3:]], dim=-1)
+
+
 def rescale_to_match_predicted(gt_depth, pred_depth):
     """
     Crude per-sample global scale correction: multiply GT depth so its
@@ -137,11 +247,17 @@ def rescale_to_match_predicted(gt_depth, pred_depth):
 @torch.no_grad()
 def evaluate(model, loader, transform, device, mode, ema=None):
     """
-    mode: "predicted" | "gt_depth" | "gt_depth_scaled"
+    mode: "predicted" | "gt_depth" | "gt_depth_scaled" |
+          "gt_pose" | "gt_pose_scaled" |
+          "gt_pose_depth" | "gt_pose_depth_scaled"
     """
     model.eval()
     metrics = SegmentationMetrics(THRESHOLDS)
     n = 0
+
+    use_gt_depth = mode in ("gt_depth", "gt_depth_scaled", "gt_pose_depth", "gt_pose_depth_scaled")
+    use_gt_pose = mode in ("gt_pose", "gt_pose_scaled", "gt_pose_depth", "gt_pose_depth_scaled")
+    use_scaled = mode.endswith("_scaled")
 
     for raw in loader:
         vb = transform(raw)
@@ -151,17 +267,27 @@ def evaluate(model, loader, transform, device, mode, ema=None):
         if mode == "predicted":
             out = model(vox, vb)
         else:
-            # First pass: get the model's predicted depth at its native
-            # resolution so we know target_hw for resizing GT depth,
-            # and (for gt_depth_scaled) the reference depth to match scale to.
+            # First pass: get the model's predicted depth/pose so we
+            # know target_hw for resizing GT depth, and (for *_scaled
+            # modes) the reference values to match scale to.
             probe = model(vox, vb)
-            low_hw = probe["depths"].shape[-2:]
-            gt_depth, valid_ref = build_gt_depth_tensor(raw, low_hw, device)
 
-            if mode == "gt_depth_scaled":
-                gt_depth = rescale_to_match_predicted(gt_depth, probe["depth"])
+            gt_depths_arg = None
+            if use_gt_depth:
+                low_hw = probe["depths"].shape[-2:]
+                gt_depth, _ = build_gt_depth_tensor(raw, low_hw, device)
+                if use_scaled:
+                    gt_depth = rescale_to_match_predicted(gt_depth, probe["depth"])
+                gt_depths_arg = gt_depth
 
-            out = model(vox, vb, gt_depths=gt_depth)
+            gt_pose_arg = None
+            if use_gt_pose:
+                gt_pose, _ = build_gt_pose_tensor(raw, device)
+                if use_scaled:
+                    gt_pose = rescale_pose_translation_to_match_predicted(gt_pose, probe["pose"])
+                gt_pose_arg = gt_pose
+
+            out = model(vox, vb, gt_depths=gt_depths_arg, gt_pose=gt_pose_arg)
 
         probs = torch.sigmoid(out["mask"])
         gts = raw.frames[-1].mask
@@ -218,12 +344,18 @@ def main():
 
     loader = trainer.train_loader if args.overfit else (trainer.val_loader or trainer.train_loader)
 
+    modes = [
+        "predicted",
+        "gt_depth", "gt_depth_scaled",
+        "gt_pose", "gt_pose_scaled",
+        "gt_pose_depth", "gt_pose_depth_scaled",
+    ]
     results = {}
-    for mode in ["predicted", "gt_depth", "gt_depth_scaled"]:
+    for mode in modes:
         r, n = evaluate(trainer.model, loader, trainer.transform, trainer.device, mode)
         results[mode] = r
         logger.info(
-            f"[{mode:16s}] n={n:5d} IoU={r['best_iou']:.4f} F1={r['best_f1']:.4f} "
+            f"[{mode:20s}] n={n:5d} IoU={r['best_iou']:.4f} F1={r['best_f1']:.4f} "
             f"dr={r['pred_dynamic_ratio']:.4f}"
         )
 
@@ -231,16 +363,22 @@ def main():
     logger.info("=" * 60)
     logger.info("Summary")
     logger.info("=" * 60)
-    logger.info(f"predicted depth+pose  IoU: {results['predicted']['best_iou']:.4f}")
-    logger.info(f"GT depth, pred pose   IoU: {results['gt_depth']['best_iou']:.4f}")
-    logger.info(f"GT depth (scale-matched), pred pose IoU: {results['gt_depth_scaled']['best_iou']:.4f}")
+    logger.info(f"predicted depth, predicted pose            IoU: {results['predicted']['best_iou']:.4f}")
+    logger.info(f"GT depth,        predicted pose             IoU: {results['gt_depth']['best_iou']:.4f}")
+    logger.info(f"GT depth (scaled), predicted pose            IoU: {results['gt_depth_scaled']['best_iou']:.4f}")
+    logger.info(f"predicted depth, GT pose                    IoU: {results['gt_pose']['best_iou']:.4f}")
+    logger.info(f"predicted depth, GT pose (scaled)           IoU: {results['gt_pose_scaled']['best_iou']:.4f}")
+    logger.info(f"GT depth,        GT pose                    IoU: {results['gt_pose_depth']['best_iou']:.4f}")
+    logger.info(f"GT depth (scaled), GT pose (scaled)         IoU: {results['gt_pose_depth_scaled']['best_iou']:.4f}")
     logger.info("")
     logger.info("Interpretation:")
-    logger.info(" - gt_depth/gt_depth_scaled >> predicted  -> depth prediction is the bottleneck")
-    logger.info(" - all three similarly low                -> depth isn't (only) the problem;")
-    logger.info("   suspect pose prediction and/or the mask-refinement head.")
-    logger.info("   (pose is still PREDICTED in all three modes above --")
-    logger.info("   this script only isolates depth, not pose.)")
+    logger.info(" - gt_depth* >> predicted, gt_pose* ~= predicted  -> depth is the bottleneck")
+    logger.info(" - gt_pose*  >> predicted, gt_depth* ~= predicted -> pose is the bottleneck")
+    logger.info(" - gt_pose_depth* >> both individual gt_* results -> depth AND pose both matter")
+    logger.info("   (their errors partially cancel/compound with each other)")
+    logger.info(" - even gt_pose_depth_scaled stays near 'predicted' -> geometry (depth+pose)")
+    logger.info("   isn't the bottleneck at all; suspect the mask-refinement head itself")
+    logger.info("   (--gt-mask-sanity is the tool for that).")
 
 
 if __name__ == "__main__":

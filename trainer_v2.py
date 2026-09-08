@@ -326,7 +326,6 @@ class TrainerV2:
         self.writer.close()
 
     def _log_step(self, epoch, batch_idx, gs, total_loss, lo, gn):
-        print(lo)
         self.writer.add_scalar("train/total_loss", total_loss.item(), gs)
         for k in ["photometric_loss", "depth_smoothness_loss", "pose_temporal_loss",
                    "sparsity_loss", "dynamic_ratio", "depth_diversity",
