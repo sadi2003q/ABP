@@ -93,7 +93,16 @@ def build_gt_depth_tensor(raw_batch, target_hw, device):
                 if t == T - 1:
                     ref_valid[i] = False
             else:
-                dt = torch.as_tensor(d, dtype=torch.float32, device=device)
+                # EVIMO2 stores dataset_depth.npz as raw uint16
+                # MILLIMETERS (confirmed against the dataset authors'
+                # own converter, evimo_flow.py: "depth_frame_mm.astype
+                # (np.float32) / 1000.0"). Neither this repo's reader
+                # (src/data/evimo2/_reader.py::load_depth) nor
+                # src/data/dataset.py applies that conversion -- they
+                # hand back raw millimeters. Convert to meters here so
+                # GT depth is on a physically correct scale before any
+                # comparison/substitution.
+                dt = torch.as_tensor(d, dtype=torch.float32, device=device) / 1000.0
                 if dt.shape[-2:] != tuple(target_hw):
                     dt = F.interpolate(
                         dt.unsqueeze(0).unsqueeze(0), size=target_hw,
