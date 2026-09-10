@@ -467,7 +467,12 @@ class TrainerGTMask:
                 camera_distortion=batch["camera_distortion"],
             )
             probs = torch.sigmoid(outputs["mask"])
-            gt_bin = batch["gt_mask"].bool().squeeze(1)
+            # SegmentationMetrics.update() moves `pred` to CPU internally
+            # but not `gt` -- it expects the caller to hand it CPU tensors
+            # (every other caller in this repo passes raw numpy/CPU masks).
+            # Our gt_mask lives on self.device (CUDA), so move it here or
+            # gt_sum/tp/fp/... (CPU buffers) blow up on a device mismatch.
+            gt_bin = batch["gt_mask"].bool().squeeze(1).cpu()
             metrics.update(probs, gt_bin, frame_motions=None)
 
         r = metrics.compute()
