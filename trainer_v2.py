@@ -89,6 +89,19 @@ class EMA:
 
 
 class TrainerV2:
+    def _build_model(self, cfg: TrainConfigV2) -> nn.Module:
+        """Construct the model. Overridden by TrainerV3 to swap in
+        WorldModelV3 while reusing every other line of __init__
+        (optimizer, scheduler, dataloaders, EMA, loss) unchanged, so
+        v2/v3 runs stay directly comparable."""
+        return WorldModelV2(
+            num_bins=cfg.num_bins,
+            event_channels=cfg.event_channels,
+            imu_hidden=cfg.imu_hidden,
+            imu_embedding=cfg.imu_embedding,
+            memory_type=cfg.memory_type,
+        )
+
     def __init__(self, cfg: TrainConfigV2):
         self.cfg = cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,16 +118,10 @@ class TrainerV2:
         (self.save_dir / "checkpoints").mkdir(exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(self.save_dir / "tb"))
 
-        self.model = WorldModelV2(
-            num_bins=cfg.num_bins,
-            event_channels=cfg.event_channels,
-            imu_hidden=cfg.imu_hidden,
-            imu_embedding=cfg.imu_embedding,
-            memory_type=cfg.memory_type,
-        ).to(self.device)
+        self.model = self._build_model(cfg).to(self.device)
 
         n_params = sum(p.numel() for p in self.model.parameters())
-        logger.info(f"Model v2 parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+        logger.info(f"Model parameters: {n_params:,} ({n_params/1e6:.2f}M)")
 
         self.loss_fn = TotalLossV2(
             photometric_loss_weight=cfg.photometric_loss_weight,
@@ -326,6 +333,7 @@ class TrainerV2:
         self.writer.close()
 
     def _log_step(self, epoch, batch_idx, gs, total_loss, lo, gn):
+        print(lo)
         self.writer.add_scalar("train/total_loss", total_loss.item(), gs)
         for k in ["photometric_loss", "depth_smoothness_loss", "pose_temporal_loss",
                    "sparsity_loss", "dynamic_ratio", "depth_diversity",
