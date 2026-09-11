@@ -59,6 +59,12 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--overfit", action="store_true")
     p.add_argument("--resume-from", type=str, default=None)
+    p.add_argument("--balance-dynamic-batches", action="store_true",
+                    help="Guarantee every training batch contains at least "
+                         "--min-dynamic-per-batch windows with non-empty GT "
+                         "dynamic mask. Recommended for short/sparse-motion "
+                         "sequences.")
+    p.add_argument("--min-dynamic-per-batch", type=int, default=1)
     args = p.parse_args()
 
     save_dir = Path(args.save_dir)
@@ -104,6 +110,8 @@ def main():
         seed=args.seed,
         overfit_mode=args.overfit,
         resume_from=args.resume_from,
+        balance_dynamic_batches=args.balance_dynamic_batches,
+        min_dynamic_per_batch=args.min_dynamic_per_batch,
     )
 
     trainer = TrainerGTMask(cfg)

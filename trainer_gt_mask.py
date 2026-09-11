@@ -90,6 +90,15 @@ class TrainConfigGTMask:
     seed: int = 42
     overfit_mode: bool = False
     resume_from: str | None = None
+    balance_dynamic_batches: bool = False
+    """If True, use DynamicBalancedBatchSampler so every training
+    batch contains at least `min_dynamic_per_batch` windows whose
+    GT mask has at least one dynamic pixel. Recommended for short/
+    sparse-motion sequences where dynamic frames are a small,
+    contiguous minority (plain shuffling can leave many consecutive
+    batches with zero positive examples, making training curves
+    hard to read and slowing convergence)."""
+    min_dynamic_per_batch: int = 1
 
 
 class EMA:
@@ -197,11 +206,26 @@ class TrainerGTMask:
         )
         tds = TemporalEVIMO2Dataset(ds, history_offsets=history_offsets)
         logger.info(f"Train: {len(tds)} windows (frame_gap={self.cfg.frame_gap})")
-        self.train_loader = DataLoader(
-            tds, batch_size=self.cfg.batch_size, shuffle=True,
-            collate_fn=temporal_collate_fn,
-            num_workers=self.cfg.num_workers, pin_memory=self.cfg.pin_memory, drop_last=True,
-        )
+
+        if self.cfg.balance_dynamic_batches:
+            from src.data.dynamic_balanced_sampler import DynamicBalancedBatchSampler
+            self.train_batch_sampler = DynamicBalancedBatchSampler(
+                tds, batch_size=self.cfg.batch_size,
+                min_dynamic_per_batch=self.cfg.min_dynamic_per_batch,
+                drop_last=True, seed=self.cfg.seed,
+            )
+            self.train_loader = DataLoader(
+                tds, batch_sampler=self.train_batch_sampler,
+                collate_fn=temporal_collate_fn,
+                num_workers=self.cfg.num_workers, pin_memory=self.cfg.pin_memory,
+            )
+        else:
+            self.train_batch_sampler = None
+            self.train_loader = DataLoader(
+                tds, batch_size=self.cfg.batch_size, shuffle=True,
+                collate_fn=temporal_collate_fn,
+                num_workers=self.cfg.num_workers, pin_memory=self.cfg.pin_memory, drop_last=True,
+            )
 
         self.val_loader = None
         if not self.cfg.overfit_mode and self.cfg.val_split:
@@ -319,6 +343,16 @@ class TrainerGTMask:
             "camera_intrinsics": [frame_tgt_raw.camera_intrinsics[i] for i in valid_idx],
             "camera_distortion": [frame_tgt_raw.camera_distortion[i] for i in valid_idx],
             "gt_mask": gt_mask,
+            # Raw (un-binarized) EVIMO2 masks + their FrameMotion, kept
+            # around so _evaluate() can hand them to SegmentationMetrics
+            # directly -- that class does its OWN speed-thresholded
+            # binarization internally and returns an all-zero mask if
+            # you pass frame_motions=None (see get_dynamic_object_ids),
+            # so passing an already-binarized mask through it a SECOND
+            # time silently zeroes out real dynamic pixels. gt_mask
+            # above is for the loss function; gt_mask_raw+frame_motions
+            # are for metrics.
+            "gt_mask_raw": [gt_masks_raw[i] for i in valid_idx],
             "frame_motions": [frame_motions[i] for i in valid_idx],
         }
 
@@ -334,6 +368,8 @@ class TrainerGTMask:
         global_step = self.start_epoch * steps_per_epoch
 
         for epoch in range(self.start_epoch, cfg.epochs):
+            if self.train_batch_sampler is not None:
+                self.train_batch_sampler.set_epoch(epoch)
             self.model.train()
             t0 = time.time()
             last_loss = None
@@ -467,13 +503,16 @@ class TrainerGTMask:
                 camera_distortion=batch["camera_distortion"],
             )
             probs = torch.sigmoid(outputs["mask"])
-            # SegmentationMetrics.update() moves `pred` to CPU internally
-            # but not `gt` -- it expects the caller to hand it CPU tensors
-            # (every other caller in this repo passes raw numpy/CPU masks).
-            # Our gt_mask lives on self.device (CUDA), so move it here or
-            # gt_sum/tp/fp/... (CPU buffers) blow up on a device mismatch.
-            gt_bin = batch["gt_mask"].bool().squeeze(1).cpu()
-            metrics.update(probs, gt_bin, frame_motions=None)
+            # Pass the RAW (un-binarized) EVIMO2 mask + real per-sample
+            # FrameMotion so SegmentationMetrics does its own correct
+            # speed-thresholded binarization. Passing frame_motions=None
+            # here (as this used to do) makes get_dynamic_object_ids()
+            # return an empty set for every sample, which makes
+            # evimo2_mask_to_binary_dynamic() short-circuit to an
+            # all-zero mask regardless of the real mask content --
+            # silently reporting gt_dr=0 even when real dynamic pixels
+            # exist. See _prepare_batch's gt_mask_raw for details.
+            metrics.update(probs, batch["gt_mask_raw"], frame_motions=batch["frame_motions"])
 
         r = metrics.compute()
         self.writer.add_scalar(f"{tag}/iou", r["best_iou"], 0)
