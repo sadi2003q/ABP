@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 import random
 
+import numpy as np
 from torch.utils.data import Sampler
 
 logger = logging.getLogger(__name__)
@@ -60,40 +61,79 @@ def build_dynamic_window_index(temporal_dataset) -> list[bool]:
     """
     Returns a list of length len(temporal_dataset): True at index i
     iff temporal_dataset[i]'s TARGET frame has a non-empty GT dynamic
-    mask. Computed cheaply (mask + cached frame_motion only, no
-    events/depth/IMU/RGB) directly against the underlying
-    EVIMO2Dataset's per-sequence readers/caches.
+    mask.
+
+    IMPORTANT: this opens its OWN independent np.load() handle per
+    sequence's dataset_mask.npz, separate from
+    frame_dataset.readers[sid]. Do NOT call reader.load_mask() (the
+    live EVIMO2Reader instance shared with the dataset) here: that
+    lazily opens and CACHES an npz zip handle on `reader._mask`, and
+    since this function runs in the main process before the
+    DataLoader forks/spawns its workers, that live reader object
+    (and its now-open, partially-read zip handle) gets duplicated
+    into every worker process. Workers then race on the same
+    zip file offset, corrupting reads and raising
+    `zipfile.BadZipFile: Bad magic number for file header` --
+    nondeterministically, on whichever sequence/worker loses the
+    race. Opening a throwaway np.load() here (like
+    EVIMO2Reader._build_index does for its own one-off index scan)
+    and closing it before returning avoids touching any object that
+    later gets forked into a worker.
     """
     from src.utils.metrics import get_dynamic_object_ids, evimo2_mask_to_binary_dynamic
 
     frame_dataset = temporal_dataset.frame_dataset
     references = frame_dataset.index.references
 
+    # One independent, throwaway np.load() per sequence (not the
+    # shared reader's cached self._mask), closed via `with` before we
+    # return -- so nothing forked into DataLoader workers is touched.
+    mask_archives: dict = {}
+
+    def _get_mask_archive(sequence_id, mask_file):
+        if sequence_id not in mask_archives:
+            mask_archives[sequence_id] = (
+                np.load(mask_file) if mask_file.exists() else None
+            )
+        return mask_archives[sequence_id]
+
     is_dynamic = []
-    for window_indices in temporal_dataset.valid_windows:
-        target_global_idx = window_indices[-1]
-        ref = references[target_global_idx]
-        sequence = frame_dataset.index.sequences[ref.sequence_id]
-        parser = frame_dataset.parsers[sequence.sequence_id]
-        reader = frame_dataset.readers[sequence.sequence_id]
-        frame = parser.frames[ref.local_frame_index]
+    try:
+        for window_indices in temporal_dataset.valid_windows:
+            target_global_idx = window_indices[-1]
+            ref = references[target_global_idx]
+            sequence = frame_dataset.index.sequences[ref.sequence_id]
+            parser = frame_dataset.parsers[sequence.sequence_id]
+            reader = frame_dataset.readers[sequence.sequence_id]
+            frame = parser.frames[ref.local_frame_index]
 
-        mask = reader.load_mask(frame.frame_id) if frame_dataset.load_mask else None
-        if mask is None:
-            is_dynamic.append(False)
-            continue
+            mask = None
+            if frame_dataset.load_mask:
+                archive = _get_mask_archive(sequence.sequence_id, reader.mask_file)
+                if archive is not None:
+                    key = f"mask_{frame.frame_id:010d}"
+                    if key in archive.files:
+                        mask = archive[key]
 
-        motion_cache = frame_dataset.frame_motion[sequence.sequence_id]
+            if mask is None:
+                is_dynamic.append(False)
+                continue
 
-        class _FM:
-            pass
-        fm = _FM()
-        fm.object_ids = motion_cache.object_ids
-        fm.speed = motion_cache.speed[ref.local_frame_index]
+            motion_cache = frame_dataset.frame_motion[sequence.sequence_id]
 
-        ids = get_dynamic_object_ids(fm)
-        gt = evimo2_mask_to_binary_dynamic(mask, ids)
-        is_dynamic.append(bool(gt.any()))
+            class _FM:
+                pass
+            fm = _FM()
+            fm.object_ids = motion_cache.object_ids
+            fm.speed = motion_cache.speed[ref.local_frame_index]
+
+            ids = get_dynamic_object_ids(fm)
+            gt = evimo2_mask_to_binary_dynamic(mask, ids)
+            is_dynamic.append(bool(gt.any()))
+    finally:
+        for archive in mask_archives.values():
+            if archive is not None:
+                archive.close()
 
     return is_dynamic
 
