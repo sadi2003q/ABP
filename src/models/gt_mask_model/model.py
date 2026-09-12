@@ -299,6 +299,13 @@ class GTMaskModel(nn.Module):
             "warped_voxel": warped_voxel_full.detach() if warped_voxel_full is not None else None,
             "K": K,
             "distortion": distortion,
+            # Kept WITH gradients (not detached) for contrastive/
+            # feature-consistency losses that need to backprop into
+            # the encoder itself, not just the mask head. Both at
+            # (B, 256, H/16, W/16) -- the bottleneck feature pyramid
+            # level used for the warp.
+            "warped_feat": warped_feat,
+            "feat_t1": feat_t1,
         }
 
     @staticmethod
