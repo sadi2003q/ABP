@@ -52,8 +52,9 @@ def main():
                     help="Fraction of highest-(smoothed)-residual pixels used as confident dynamic anchors.")
     p.add_argument("--smooth-kernel", type=int, default=3,
                     help="Local-average smoothing window for dynamic-anchor ranking (spatial coherence).")
-    p.add_argument("--margin", type=float, default=1.0,
-                    help="Minimum desired feature-space distance at dynamic anchors.")
+    p.add_argument("--margin-ratio", type=float, default=3.0,
+                    help="Dynamic anchors pushed to at least margin_ratio x the "
+                         "static anchors' own mean distance (auto-scales with feature magnitude).")
     p.add_argument("--neg-weight", type=float, default=1.0)
     p.add_argument("--mask-bce-weight", type=float, default=1.0)
     p.add_argument("--save-dir", type=str, default="runs/exp_gt_mask_contrastive")
@@ -99,7 +100,7 @@ def main():
         static_percentile=args.static_percentile,
         dynamic_percentile=args.dynamic_percentile,
         smooth_kernel=args.smooth_kernel,
-        margin=args.margin,
+        margin_ratio=args.margin_ratio,
         neg_weight=args.neg_weight,
         mask_bce_weight=args.mask_bce_weight,
         log_every_n_steps=args.log_every_n_steps,

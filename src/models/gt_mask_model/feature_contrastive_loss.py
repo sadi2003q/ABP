@@ -92,8 +92,16 @@ class FeatureContrastiveLoss(nn.Module):
         window applied to the residual before ranking for dynamic
         anchors, to prefer spatially-coherent regions over lone noisy
         pixels.
-    margin : minimum desired L2 distance between warped/actual
-        features at dynamic anchors.
+    margin_ratio : dynamic anchors are pushed to have feature distance
+        at least `margin_ratio` times the STATIC anchors' own mean
+        distance (computed fresh each batch, detached from the pos
+        term's gradient). This auto-scales with whatever magnitude the
+        encoder's features happen to have -- a fixed absolute margin
+        (e.g. 1.0) silently does nothing once features exceed that
+        scale, which is exactly what caused neg_loss=0 from step 0 in
+        early testing: raw 256-dim L2 distances were already >1.0
+        before any learning happened, so relu(margin - dist) was 0 for
+        every dynamic anchor and the negative term never contributed.
     neg_weight : weight of the dynamic (negative-pair) term relative
         to the static (positive-pair) term.
     mask_bce_weight : weight of the auxiliary mask-training BCE term
@@ -108,7 +116,7 @@ class FeatureContrastiveLoss(nn.Module):
         static_percentile: float = 0.3,
         dynamic_percentile: float = 0.1,
         smooth_kernel: int = 3,
-        margin: float = 1.0,
+        margin_ratio: float = 3.0,
         neg_weight: float = 1.0,
         mask_bce_weight: float = 1.0,
     ):
@@ -118,7 +126,7 @@ class FeatureContrastiveLoss(nn.Module):
         self.static_percentile = static_percentile
         self.dynamic_percentile = dynamic_percentile
         self.smooth_kernel = smooth_kernel
-        self.margin = margin
+        self.margin_ratio = margin_ratio
         self.neg_weight = neg_weight
         self.mask_bce_weight = mask_bce_weight
 
@@ -158,15 +166,22 @@ class FeatureContrastiveLoss(nn.Module):
 
         pos_losses = []
         neg_losses = []
+        adaptive_margins = []
         for b in range(B):
             static_idx = torch.topk(flat_dist[b], n_static, largest=False).indices
             dynamic_idx = torch.topk(flat_dist_smooth[b], n_dynamic, largest=True).indices
 
-            pos_losses.append((flat_dist[b, static_idx] ** 2).mean())
-            neg_losses.append(F.relu(self.margin - flat_dist[b, dynamic_idx]).mean())
+            static_dists = flat_dist[b, static_idx]
+            pos_losses.append((static_dists ** 2).mean())
+
+            adaptive_margin = static_dists.detach().mean() * self.margin_ratio
+            adaptive_margins.append(adaptive_margin)
+            dynamic_dists = flat_dist[b, dynamic_idx]
+            neg_losses.append(F.relu(adaptive_margin - dynamic_dists).mean())
 
         pos_loss = torch.stack(pos_losses).mean()
         neg_loss = torch.stack(neg_losses).mean()
+        mean_adaptive_margin = torch.stack(adaptive_margins).mean()
         contrastive_loss = pos_loss + self.neg_weight * neg_loss
 
         dist_detached = dist.detach().unsqueeze(1)
@@ -192,4 +207,5 @@ class FeatureContrastiveLoss(nn.Module):
             "weighted_mask_bce": weighted_mask_bce.detach(),
             "pred_dynamic_ratio": torch.sigmoid(mask_logits).mean().detach(),
             "pseudo_mask_mean": pseudo_mask.mean().detach(),
+            "adaptive_margin": mean_adaptive_margin.detach(),
         }

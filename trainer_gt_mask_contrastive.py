@@ -78,7 +78,7 @@ class TrainConfigGTMaskContrastive:
     """Fraction of highest-(smoothed)-residual pixels used as confident
     dynamic anchors."""
     smooth_kernel: int = 3
-    margin: float = 1.0
+    margin_ratio: float = 3.0
     neg_weight: float = 1.0
     mask_bce_weight: float = 1.0
     log_every_n_steps: int = 10
@@ -156,7 +156,7 @@ class TrainerGTMaskContrastive:
             static_percentile=cfg.static_percentile,
             dynamic_percentile=cfg.dynamic_percentile,
             smooth_kernel=cfg.smooth_kernel,
-            margin=cfg.margin,
+            margin_ratio=cfg.margin_ratio,
             neg_weight=cfg.neg_weight,
             mask_bce_weight=cfg.mask_bce_weight,
         ).to(self.device)
@@ -431,7 +431,7 @@ class TrainerGTMaskContrastive:
     def _log_step(self, epoch, batch_idx, gs, total_loss, lo, gn):
         self.writer.add_scalar("train/total_loss", total_loss.item(), gs)
         for k in ["pos_loss", "neg_loss", "contrastive_loss", "mask_bce",
-                  "pred_dynamic_ratio", "pseudo_mask_mean"]:
+                  "pred_dynamic_ratio", "pseudo_mask_mean", "adaptive_margin"]:
             if k in lo and isinstance(lo[k], torch.Tensor):
                 self.writer.add_scalar(f"train/{k}", lo[k].item(), gs)
         self.writer.add_scalar("train/grad_norm", gn.item(), gs)
@@ -443,6 +443,7 @@ class TrainerGTMaskContrastive:
                 f"loss={total_loss.item():.4f} | "
                 f"pos={lo.get('pos_loss', torch.tensor(0.0)).item():.4f} | "
                 f"neg={lo.get('neg_loss', torch.tensor(0.0)).item():.4f} | "
+                f"margin={lo.get('adaptive_margin', torch.tensor(0.0)).item():.4f} | "
                 f"mask_bce={lo.get('mask_bce', torch.tensor(0.0)).item():.4f} | "
                 f"pred_dr={lo.get('pred_dynamic_ratio', torch.tensor(0.0)).item():.3f} | "
                 f"pseudo_dr={lo.get('pseudo_mask_mean', torch.tensor(0.0)).item():.3f} | "
