@@ -1,53 +1,60 @@
 """
-Trainer for SELF-SUPERVISED mask-consistency training of GTMaskModel.
+Trainer for GTMaskModel using a SELF-SUPERVISED PHOTOMETRIC loss —
+mask prediction from GROUND-TRUTH depth and GROUND-TRUTH pose, with
+NO real GT mask used in training (only at evaluation time, to report
+IoU/F1 against ground truth for your own judgment).
 
 Difference from trainer_gt_mask.py (TrainerGTMask)
 ----------------------------------------------------
-TrainerGTMask trains with GTMaskLoss: direct supervision against the
+TrainerGTMask trains with GTMaskLoss: DIRECT supervision against the
 real EVIMO2 GT dynamic mask (BCE+Dice vs ground truth labels). That
-is standard supervised learning, not self-supervised, even though
-depth/pose inputs are ground truth.
+is standard supervised learning, not self-supervised.
 
-TrainerGTMaskConsistency (this file) trains with MaskConsistencyLoss
-(consistency_loss.py): the ONLY training signal is agreement between
-the model's own predictions at two consecutive frame pairs, warped
-into alignment using GT depth + GT pose (still ground truth -- this
-stage deliberately keeps depth/pose fixed to isolate "does a
-consistency loss alone work" from "do predicted depth/pose also
-work", per the incremental plan). The real GT mask is loaded ONLY
-for evaluation (to report IoU/F1 against ground truth so you can
-judge how good the self-supervised result is) -- it is never part of
-the loss or backward pass.
+TrainerGTMaskPhotometric (this file) trains with
+PhotometricGTMaskLoss, which mirrors this project's actual V2/V3
+recipe (see src/losses/total_loss_v2.py +
+dynamic_mask_regularization_loss.py): the mask head is trained via
+BCE against the GT-geometry warp RESIDUAL (a pseudo-label the model
+computes itself from exact GT depth+pose -- never the real GT mask),
+plus a sparsity+confidence regularizer to prevent collapse. This is
+the self-supervised formulation your supervisor asked for, using
+photometric/geometric residual as the training signal instead of
+direct mask supervision or the (memory-heavy) mask-consistency
+alternative.
 
 Data requirement
------------------
-Needs a 3-FRAME window (t-2, t-1, t), not the 2-frame window
-TrainerGTMask uses, because computing a consistency signal requires
-two separate forward passes: (t-2 -> t-1) and (t-1 -> t).
+----------------
+Same as TrainerGTMask: a PAIR of consecutive frames (t-1, t). Only
+ONE forward pass per step (unlike the mask-consistency trainer's
+two), so memory usage matches the original supervised trainer.
 """
 
 from __future__ import annotations
 
-import time, math, logging
+import os, time, math, logging
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from src.models.gt_mask_model.model import GTMaskModel
-from src.models.gt_mask_model.consistency_loss import MaskConsistencyLoss
+from src.models.gt_mask_model.photometric_gt_loss import PhotometricGTMaskLoss
 from src.models.gt_mask_model.gt_depth_utils import build_gt_depth_batch
-from src.models.gt_mask_model.gt_pose_utils import batch_gt_relative_pose_9d
-from src.utils.metrics import SegmentationMetrics, get_dynamic_object_ids, evimo2_mask_to_binary_dynamic
+from src.utils.metrics import (
+    SegmentationMetrics,
+    get_dynamic_object_ids,
+    evimo2_mask_to_binary_dynamic,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TrainConfigGTMaskConsistency:
+class TrainConfigGTMaskPhotometric:
     dataset_root: str = "/home/z/my-project/data/dataset_root"
     sensors: tuple = ("left_camera",)
     split: str = "train"
@@ -55,9 +62,11 @@ class TrainConfigGTMaskConsistency:
     sequence: tuple | None = None
     val_split: str = "val"
     frame_gap: int = 1
+    """Frame offset between the source (t-1) and target (t) frame,
+    in dataset frame units. 1 = adjacent frames."""
     num_bins: int = 5
     event_channels: int = 256
-    mask_extra_input: str = "photometric"
+    mask_extra_input: str = "photometric"  # "photometric" | "none"
     batch_size: int = 4
     num_workers: int = 4
     pin_memory: bool = True
@@ -69,20 +78,31 @@ class TrainConfigGTMaskConsistency:
     grad_clip_max_norm: float = 1.0
     use_ema: bool = True
     ema_decay: float = 0.999
-    bce_weight: float = 1.0
-    dice_weight: float = 1.0
-    collapse_penalty_weight: float = 0.5
-    target_dynamic_ratio: float = 0.02
+    residual_weight: float = 1.0
+    """Weight of the BCE-against-warp-residual pseudo-label term
+    (analogous to TotalLossV2's residual_mask_weight)."""
+    sparsity_weight: float = 5.0
+    confidence_weight: float = 1.0
+    target_dynamic_ratio: float = 0.05
+    """Expected fraction of dynamic pixels, used by the sparsity
+    regularizer -- project convention: ~0.05 for indoor scenes."""
     log_every_n_steps: int = 10
     viz_every_n_steps: int = 50
     viz_max_samples: int = 4
-    eval_every_n_epochs: int = 2
+    eval_every_n_epochs: int = 5
     checkpoint_every_n_epochs: int = 5
-    save_dir: str = "runs/exp_gt_mask_consistency"
+    save_dir: str = "runs/exp_gt_mask"
     seed: int = 42
     overfit_mode: bool = False
     resume_from: str | None = None
     balance_dynamic_batches: bool = False
+    """If True, use DynamicBalancedBatchSampler so every training
+    batch contains at least `min_dynamic_per_batch` windows whose
+    GT mask has at least one dynamic pixel. Recommended for short/
+    sparse-motion sequences where dynamic frames are a small,
+    contiguous minority (plain shuffling can leave many consecutive
+    batches with zero positive examples, making training curves
+    hard to read and slowing convergence)."""
     min_dynamic_per_batch: int = 1
 
 
@@ -109,8 +129,8 @@ class EMA:
         self.shadow = {k: v.clone() for k, v in sd.items()}
 
 
-class TrainerGTMaskConsistency:
-    def __init__(self, cfg: TrainConfigGTMaskConsistency):
+class TrainerGTMaskPhotometric:
+    def __init__(self, cfg: TrainConfigGTMaskPhotometric):
         self.cfg = cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Device: {self.device}")
@@ -137,9 +157,10 @@ class TrainerGTMaskConsistency:
 
         self._build_dataloaders()
 
-        self.loss_fn = MaskConsistencyLoss(
-            bce_weight=cfg.bce_weight, dice_weight=cfg.dice_weight,
-            collapse_penalty_weight=cfg.collapse_penalty_weight,
+        self.loss_fn = PhotometricGTMaskLoss(
+            residual_weight=cfg.residual_weight,
+            sparsity_weight=cfg.sparsity_weight,
+            confidence_weight=cfg.confidence_weight,
             target_dynamic_ratio=cfg.target_dynamic_ratio,
         ).to(self.device)
 
@@ -149,6 +170,7 @@ class TrainerGTMaskConsistency:
 
         steps_per_epoch = len(self.train_loader)
         total_steps = steps_per_epoch * cfg.epochs
+
 
         def lr_lambda(step):
             progress = step / max(1, total_steps)
@@ -168,7 +190,7 @@ class TrainerGTMaskConsistency:
             self._resume(cfg.resume_from)
 
     # ------------------------------------------------------------
-    # Data (3-frame windows: t-2, t-1, t)
+    # Data
     # ------------------------------------------------------------
 
     def _build_dataloaders(self):
@@ -177,7 +199,7 @@ class TrainerGTMaskConsistency:
         from src.data.collate import temporal_collate_fn
         from src.data.transforms import Compose, ToTensor, NormalizeEventTime, NormalizeIMU, VoxelizeEvents
 
-        history_offsets = (-2 * self.cfg.frame_gap, -self.cfg.frame_gap, 0)
+        history_offsets = (-self.cfg.frame_gap, 0)
 
         ds = EVIMO2Dataset(
             dataset_root=self.cfg.dataset_root,
@@ -187,7 +209,7 @@ class TrainerGTMaskConsistency:
             sequence=self.cfg.sequence,
         )
         tds = TemporalEVIMO2Dataset(ds, history_offsets=history_offsets)
-        logger.info(f"Train: {len(tds)} windows (frame_gap={self.cfg.frame_gap}, 3-frame)")
+        logger.info(f"Train: {len(tds)} windows (frame_gap={self.cfg.frame_gap})")
 
         if self.cfg.balance_dynamic_batches:
             from src.data.dynamic_balanced_sampler import DynamicBalancedBatchSampler
@@ -233,104 +255,88 @@ class TrainerGTMaskConsistency:
         ])
 
     # ------------------------------------------------------------
-    # Batch preparation for a 3-frame window
+    # GT construction per batch
     # ------------------------------------------------------------
 
     def _prepare_batch(self, raw_batch, voxel_batch):
         """
-        Builds everything needed for TWO forward passes:
-          pair A: (t-2 -> t-1)
-          pair B: (t-1 -> t)
-        plus GT depth/pose for both pairs (still ground truth at this
-        stage), and the REAL GT mask at frame t ONLY for evaluation
-        (never used in the loss).
-        Drops samples missing GT depth/pose at any of the 3 frames,
-        or GT mask at frame t (needed for eval bookkeeping only).
+        Build everything the model forward pass and loss need from one
+        two-frame TemporalEVIMO2Batch:
+          - voxel grids at t-1 (source) and t (target)
+          - GT depth at t-1, resized to full image resolution
+          - GT camera poses (raw CameraMotion) at t-1 and t
+          - GT dynamic mask at t (target)
+        Samples missing GT depth, GT pose, or GT mask at either frame
+        are dropped from the batch (returns None if nothing is valid).
         """
-        f_tm2 = raw_batch.frames[0]   # t-2
-        f_tm1_raw, f_tm1_vox = raw_batch.frames[1], voxel_batch.frames[1]  # t-1
-        f_t_raw, f_t_vox = raw_batch.frames[2], voxel_batch.frames[2]      # t
-        f_tm2_vox = voxel_batch.frames[0]
+        frame_src_raw = raw_batch.frames[0]   # t-1
+        frame_tgt_raw = raw_batch.frames[-1]  # t
+        frame_src_vox = voxel_batch.frames[0]
+        frame_tgt_vox = voxel_batch.frames[-1]
 
-        voxel_tm2 = f_tm2_vox.voxel_grid
-        voxel_tm1 = f_tm1_vox.voxel_grid
-        voxel_t = f_t_vox.voxel_grid
-        H, W = voxel_tm2.shape[-2:]
-        B = voxel_tm2.shape[0]
+        voxel_src = frame_src_vox.voxel_grid  # (B, C, H, W)
+        voxel_tgt = frame_tgt_vox.voxel_grid
+        H, W = voxel_src.shape[-2:]
 
-        cam_tm2 = f_tm2.camera_motion
-        cam_tm1 = f_tm1_raw.camera_motion
-        cam_t = f_t_raw.camera_motion
+        B = voxel_src.shape[0]
 
-        pose_valid = torch.tensor([
-            bool(a.pose_available) and bool(b.pose_available) and bool(c.pose_available)
-            for a, b, c in zip(cam_tm2, cam_tm1, cam_t)
-        ], dtype=torch.bool)
+        cam_src = frame_src_raw.camera_motion
+        cam_tgt = frame_tgt_raw.camera_motion
 
-        gt_depth_tm2, depth_valid_a = build_gt_depth_batch(f_tm2.depth, target_hw=(H, W), device=voxel_tm2.device)
-        gt_depth_tm1, depth_valid_b = build_gt_depth_batch(f_tm1_raw.depth, target_hw=(H, W), device=voxel_tm2.device)
+        pose_valid = torch.tensor(
+            [bool(cs.pose_available) and bool(ct.pose_available)
+             for cs, ct in zip(cam_src, cam_tgt)],
+            dtype=torch.bool,
+        )
 
-        gt_masks_t_raw = f_t_raw.mask
-        frame_motions_t = f_t_raw.frame_motion
-        mask_valid = torch.tensor([m is not None for m in gt_masks_t_raw], dtype=torch.bool)
+        gt_depth_src, depth_valid = build_gt_depth_batch(
+            frame_src_raw.depth, target_hw=(H, W), device=voxel_src.device,
+        )
 
-        valid = pose_valid & depth_valid_a & depth_valid_b & mask_valid
+        gt_masks_raw = frame_tgt_raw.mask
+        frame_motions = frame_tgt_raw.frame_motion
+        mask_valid = torch.tensor([m is not None for m in gt_masks_raw], dtype=torch.bool)
+
+        valid = pose_valid & depth_valid & mask_valid
         valid_idx = valid.nonzero(as_tuple=True)[0].tolist()
         if not valid_idx:
             return None
 
+        gt_mask_list = []
+        for i in valid_idx:
+            ids = get_dynamic_object_ids(frame_motions[i])
+            gt = evimo2_mask_to_binary_dynamic(gt_masks_raw[i], ids)
+            while gt.ndim > 2:
+                gt = gt.squeeze(0)
+            gt = gt.float()
+            if tuple(gt.shape[-2:]) != (H, W):
+                gt = F.interpolate(
+                    gt.unsqueeze(0).unsqueeze(0), size=(H, W), mode="nearest",
+                ).squeeze(0).squeeze(0)
+            gt_mask_list.append(gt)
+        gt_mask = torch.stack(gt_mask_list, dim=0).unsqueeze(1).to(voxel_src.device)
+
         return {
-            "voxel_tm2": voxel_tm2[valid_idx],
-            "voxel_tm1": voxel_tm1[valid_idx],
-            "voxel_t": voxel_t[valid_idx],
-            "gt_depth_tm2": gt_depth_tm2[valid_idx],
-            "gt_depth_tm1": gt_depth_tm1[valid_idx],
-            "camera_motion_tm2": [cam_tm2[i] for i in valid_idx],
-            "camera_motion_tm1": [cam_tm1[i] for i in valid_idx],
-            "camera_motion_t": [cam_t[i] for i in valid_idx],
-            "camera_intrinsics": [f_t_raw.camera_intrinsics[i] for i in valid_idx],
-            "camera_distortion": [f_t_raw.camera_distortion[i] for i in valid_idx],
-            # eval-only, never used in the loss:
-            "gt_mask_raw": [gt_masks_t_raw[i] for i in valid_idx],
-            "frame_motions": [frame_motions_t[i] for i in valid_idx],
+            "voxel_src": voxel_src[valid_idx],
+            "voxel_tgt": voxel_tgt[valid_idx],
+            "gt_depth_src": gt_depth_src[valid_idx],
+            "camera_motion_src": [cam_src[i] for i in valid_idx],
+            "camera_motion_tgt": [cam_tgt[i] for i in valid_idx],
+            "camera_intrinsics": [frame_tgt_raw.camera_intrinsics[i] for i in valid_idx],
+            "camera_distortion": [frame_tgt_raw.camera_distortion[i] for i in valid_idx],
+            "gt_mask": gt_mask,
+            # Raw (un-binarized) EVIMO2 masks + their FrameMotion, kept
+            # around so _evaluate() can hand them to SegmentationMetrics
+            # directly -- that class does its OWN speed-thresholded
+            # binarization internally and returns an all-zero mask if
+            # you pass frame_motions=None (see get_dynamic_object_ids),
+            # so passing an already-binarized mask through it a SECOND
+            # time silently zeroes out real dynamic pixels. gt_mask
+            # above is for the loss function; gt_mask_raw+frame_motions
+            # are for metrics.
+            "gt_mask_raw": [gt_masks_raw[i] for i in valid_idx],
+            "frame_motions": [frame_motions[i] for i in valid_idx],
         }
-
-    def _forward_two_pairs(self, batch):
-        """Runs GTMaskModel on (t-2->t-1) and (t-1->t), then warps
-        pred_mask(t-1) into t's view using GT depth(t-1)+GT pose(t-1->t)
-        via the model's own renderer -- the SAME warp mechanism used
-        internally, applied here to the predicted mask instead of
-        features."""
-        out_a = self.model(
-            voxel_t0=batch["voxel_tm2"], voxel_t1=batch["voxel_tm1"],
-            gt_depth_t0=batch["gt_depth_tm2"],
-            camera_motion_t0=batch["camera_motion_tm2"],
-            camera_motion_t1=batch["camera_motion_tm1"],
-            camera_intrinsics=batch["camera_intrinsics"],
-            camera_distortion=batch["camera_distortion"],
-        )
-        out_b = self.model(
-            voxel_t0=batch["voxel_tm1"], voxel_t1=batch["voxel_t"],
-            gt_depth_t0=batch["gt_depth_tm1"],
-            camera_motion_t0=batch["camera_motion_tm1"],
-            camera_motion_t1=batch["camera_motion_t"],
-            camera_intrinsics=batch["camera_intrinsics"],
-            camera_distortion=batch["camera_distortion"],
-        )
-
-        pred_mask_tm1_probs = torch.sigmoid(out_a["mask"])  # keep graph; consistency_loss detaches its copy
-
-        pose_tm1_to_t = batch_gt_relative_pose_9d(
-            camera_motions_target=batch["camera_motion_t"],
-            camera_motions_source=batch["camera_motion_tm1"],
-            device=pred_mask_tm1_probs.device,
-        )
-        warped_pred_mask = self.model.renderer(
-            feature=pred_mask_tm1_probs, depth=batch["gt_depth_tm1"],
-            pose=pose_tm1_to_t, K=out_b["K"], distortion=out_b["distortion"],
-        )
-
-        return out_a, out_b, warped_pred_mask
 
     # ------------------------------------------------------------
     # Train / eval loops
@@ -351,7 +357,9 @@ class TrainerGTMaskConsistency:
             last_loss = None
 
             for batch_idx, raw_batch in enumerate(self.train_loader):
-                voxel_batch = self.transform(raw_batch).to(self.device)
+                voxel_batch = self.transform(raw_batch)
+                voxel_batch = voxel_batch.to(self.device)
+
                 batch = self._prepare_batch(raw_batch, voxel_batch)
                 if batch is None:
                     continue
@@ -360,12 +368,26 @@ class TrainerGTMaskConsistency:
 
                 if self.amp_dtype:
                     with torch.amp.autocast('cuda', dtype=self.amp_dtype):
-                        out_a, out_b, warped_pred_mask = self._forward_two_pairs(batch)
-                        loss_output = self.loss_fn(out_a["mask"], warped_pred_mask, out_b["mask"])
+                        outputs = self.model(
+                            voxel_t0=batch["voxel_src"], voxel_t1=batch["voxel_tgt"],
+                            gt_depth_t0=batch["gt_depth_src"],
+                            camera_motion_t0=batch["camera_motion_src"],
+                            camera_motion_t1=batch["camera_motion_tgt"],
+                            camera_intrinsics=batch["camera_intrinsics"],
+                            camera_distortion=batch["camera_distortion"],
+                        )
+                        loss_output = self.loss_fn(outputs["mask"], outputs["residual"])
                         total_loss = loss_output["loss"]
                 else:
-                    out_a, out_b, warped_pred_mask = self._forward_two_pairs(batch)
-                    loss_output = self.loss_fn(out_a["mask"], warped_pred_mask, out_b["mask"])
+                    outputs = self.model(
+                        voxel_t0=batch["voxel_src"], voxel_t1=batch["voxel_tgt"],
+                        gt_depth_t0=batch["gt_depth_src"],
+                        camera_motion_t0=batch["camera_motion_src"],
+                        camera_motion_t1=batch["camera_motion_tgt"],
+                        camera_intrinsics=batch["camera_intrinsics"],
+                        camera_distortion=batch["camera_distortion"],
+                    )
+                    loss_output = self.loss_fn(outputs["mask"], outputs["residual"])
                     total_loss = loss_output["loss"]
 
                 if not torch.isfinite(total_loss):
@@ -373,7 +395,9 @@ class TrainerGTMaskConsistency:
                     continue
 
                 total_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip_max_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), cfg.grad_clip_max_norm,
+                )
                 self.optimizer.step()
                 self.scheduler.step()
                 if self.ema:
@@ -384,6 +408,9 @@ class TrainerGTMaskConsistency:
                 if global_step % cfg.log_every_n_steps == 0:
                     self._log_step(epoch, batch_idx, global_step, total_loss, loss_output, grad_norm)
 
+                if cfg.viz_every_n_steps > 0 and global_step % cfg.viz_every_n_steps == 0:
+                    self._log_viz(global_step, outputs, batch)
+
                 global_step += 1
 
             dt = time.time() - t0
@@ -393,10 +420,10 @@ class TrainerGTMaskConsistency:
             if (epoch + 1) % cfg.eval_every_n_epochs == 0:
                 if self.val_loader:
                     iou = self._evaluate(self.val_loader, f"val/epoch_{epoch+1}")
-                    logger.info(f"Epoch {epoch+1} val IoU (vs REAL GT, eval-only): {iou:.4f}")
+                    logger.info(f"Epoch {epoch+1} val IoU: {iou:.4f}")
                 elif cfg.overfit_mode:
                     iou = self._evaluate(self.train_loader, "overfit_eval")
-                    logger.info(f"Epoch {epoch+1} train (overfit) IoU (vs REAL GT, eval-only): {iou:.4f}")
+                    logger.info(f"Epoch {epoch+1} train (overfit) IoU: {iou:.4f}")
 
             if (epoch + 1) % cfg.checkpoint_every_n_epochs == 0:
                 self._save(epoch)
@@ -406,8 +433,8 @@ class TrainerGTMaskConsistency:
 
     def _log_step(self, epoch, batch_idx, gs, total_loss, lo, gn):
         self.writer.add_scalar("train/total_loss", total_loss.item(), gs)
-        for k in ["consistency_bce", "consistency_dice", "collapse_penalty",
-                  "pred_dynamic_ratio", "warped_target_ratio"]:
+        for k in ["residual_loss", "sparsity_loss", "confidence_loss",
+                  "pred_dynamic_ratio", "pseudo_mask_mean"]:
             if k in lo and isinstance(lo[k], torch.Tensor):
                 self.writer.add_scalar(f"train/{k}", lo[k].item(), gs)
         self.writer.add_scalar("train/grad_norm", gn.item(), gs)
@@ -417,23 +444,28 @@ class TrainerGTMaskConsistency:
             logger.info(
                 f"E{epoch+1} B{batch_idx:4d} | "
                 f"loss={total_loss.item():.4f} | "
-                f"cons_bce={lo.get('consistency_bce', torch.tensor(0.0)).item():.4f} | "
-                f"cons_dice={lo.get('consistency_dice', torch.tensor(0.0)).item():.4f} | "
-                f"collapse_pen={lo.get('collapse_penalty', torch.tensor(0.0)).item():.4f} | "
+                f"resid={lo.get('residual_loss', torch.tensor(0.0)).item():.4f} | "
+                f"sparsity={lo.get('sparsity_loss', torch.tensor(0.0)).item():.4f} | "
+                f"confidence={lo.get('confidence_loss', torch.tensor(0.0)).item():.4f} | "
                 f"pred_dr={lo.get('pred_dynamic_ratio', torch.tensor(0.0)).item():.3f} | "
-                f"warped_tgt_dr={lo.get('warped_target_ratio', torch.tensor(0.0)).item():.3f} | "
+                f"pseudo_dr={lo.get('pseudo_mask_mean', torch.tensor(0.0)).item():.3f} | "
                 f"gn={gn.item():.2f}"
             )
 
     @torch.no_grad()
+    def _log_viz(self, gs, outputs, batch):
+        mask_probs = outputs["mask_probs"].float().cpu()
+        gt = batch["gt_mask"].float().cpu()
+        residual = outputs.get("residual")
+        max_n = min(self.cfg.viz_max_samples, mask_probs.shape[0])
+        for i in range(max_n):
+            self.writer.add_image(f"mask/pred_{i}", mask_probs[i], gs)
+            self.writer.add_image(f"mask/gt_{i}", gt[i], gs)
+            if residual is not None and i < residual.shape[0]:
+                self.writer.add_image(f"mask/residual_{i}", residual[i, :1].float().cpu(), gs)
+
+    @torch.no_grad()
     def _evaluate(self, loader, tag: str) -> float:
-        """
-        EVAL-ONLY: measures the self-supervised model's predicted mask
-        (at frame t, from the t-1->t pair) against the REAL GT mask.
-        This comparison is NEVER used for training/backward -- it's
-        purely how you and your supervisor judge how good the
-        self-supervised result turned out to be.
-        """
         if self.ema:
             backup = {n: p.detach().clone() for n, p in self.model.named_parameters()}
             self.ema.apply_to(self.model)
@@ -446,15 +478,24 @@ class TrainerGTMaskConsistency:
             batch = self._prepare_batch(raw_batch, voxel_batch)
             if batch is None:
                 continue
-            out_b = self.model(
-                voxel_t0=batch["voxel_tm1"], voxel_t1=batch["voxel_t"],
-                gt_depth_t0=batch["gt_depth_tm1"],
-                camera_motion_t0=batch["camera_motion_tm1"],
-                camera_motion_t1=batch["camera_motion_t"],
+            outputs = self.model(
+                voxel_t0=batch["voxel_src"], voxel_t1=batch["voxel_tgt"],
+                gt_depth_t0=batch["gt_depth_src"],
+                camera_motion_t0=batch["camera_motion_src"],
+                camera_motion_t1=batch["camera_motion_tgt"],
                 camera_intrinsics=batch["camera_intrinsics"],
                 camera_distortion=batch["camera_distortion"],
             )
-            probs = torch.sigmoid(out_b["mask"])
+            probs = torch.sigmoid(outputs["mask"])
+            # Pass the RAW (un-binarized) EVIMO2 mask + real per-sample
+            # FrameMotion so SegmentationMetrics does its own correct
+            # speed-thresholded binarization. Passing frame_motions=None
+            # here (as this used to do) makes get_dynamic_object_ids()
+            # return an empty set for every sample, which makes
+            # evimo2_mask_to_binary_dynamic() short-circuit to an
+            # all-zero mask regardless of the real mask content --
+            # silently reporting gt_dr=0 even when real dynamic pixels
+            # exist. See _prepare_batch's gt_mask_raw for details.
             metrics.update(probs, batch["gt_mask_raw"], frame_motions=batch["frame_motions"])
 
         r = metrics.compute()
