@@ -320,11 +320,13 @@ class TrainerV2:
             logger.info(f"Epoch {epoch+1}/{cfg.epochs} done in {dt:.1f}s, loss={total_loss.item():.4f}")
 
             if (epoch + 1) % cfg.eval_every_n_epochs == 0:
+                iou = None
                 if self.val_loader:
                     iou = self._evaluate(self.val_loader, f"val/epoch_{epoch+1}")
                 elif cfg.overfit_mode:
                     iou = self._evaluate(self.train_loader, "overfit_eval")
-                logger.info(f"Epoch {epoch+1} IoU: {iou:.4f}")
+                if iou is not None:
+                    logger.info(f"Epoch {epoch+1} IoU: {iou:.4f}")
 
             if (epoch + 1) % cfg.checkpoint_every_n_epochs == 0:
                 self._save(epoch)
