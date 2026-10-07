@@ -86,7 +86,7 @@ def build_targets(raw_batch, mask_hw, depth_hw=None, need_pose=False) -> dict:
     if depth_hw is not None:
         depth_list = list(target.depth) if target.depth is not None else [None] * len(target.mask)
         gt_depth, depth_valid = build_gt_depth_batch(depth_list, target_hw=depth_hw, device=torch.device("cpu"))
-        targets["gt_depth"] = gt_depth
+        targets["gt_depth"] = gt_depth / 1000 # EVIMO2 depth is in millimetres
         targets["depth_valid"] = depth_valid
 
     if need_pose and len(raw_batch.frames) >= 2:
