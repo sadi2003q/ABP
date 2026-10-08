@@ -70,6 +70,12 @@ def main():
                    help="Fraction of pixels whose events are dropped during training "
                         "(augmentation). 0.1 recommended for full-dataset runs.")
 
+    g = p.add_argument_group("labels")
+    g.add_argument("--label-source", type=str, default="ground_truth", choices=["ground_truth", "pseudo"],
+                   help="Train on true masks, or on pseudo-labels from generate_pseudo_labels.py. "
+                        "Evaluation always uses the true masks.")
+    g.add_argument("--pseudo-label-dir", type=str, default=None)
+
     g = p.add_argument_group("model")
     g.add_argument("--no-imu", action="store_true", help="Events only, no inertial input.")
 
@@ -143,6 +149,8 @@ def main():
         balance_dynamic_batches=not args.no_balance,
         min_dynamic_per_batch=args.min_dynamic_per_batch,
         event_dropout=args.event_dropout,
+        label_source=args.label_source,
+        pseudo_label_dir=args.pseudo_label_dir,
         use_imu=not args.no_imu,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,

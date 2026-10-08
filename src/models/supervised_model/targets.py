@@ -61,18 +61,40 @@ def build_gt_pose(camera_target, camera_source):
     return pose, valid
 
 
-def build_targets(raw_batch, mask_hw, depth_hw=None, need_pose=False) -> dict:
+def build_pseudo_mask(target_frame, store, hw):
+    """Mask targets from a PseudoLabelStore instead of the true masks."""
+    H, W = hw
+    out, valid = [], []
+    n = len(target_frame.sequence_names)
+    for k in range(n):
+        lab = store.get(target_frame.sensors[k], target_frame.sequence_names[k],
+                        int(target_frame.local_frame_indices[k]))
+        if lab is None:
+            out.append(torch.zeros(H, W)); valid.append(False); continue
+        m = torch.from_numpy(lab.astype(np.float32))
+        if tuple(m.shape) != (H, W):
+            m = F.interpolate(m[None, None], size=(H, W), mode="nearest")[0, 0]
+        out.append(m); valid.append(True)
+    return torch.stack(out).unsqueeze(1), torch.tensor(valid, dtype=torch.bool)
+
+
+def build_targets(raw_batch, mask_hw, depth_hw=None, need_pose=False, pseudo_store=None) -> dict:
     """
     raw_batch : TemporalEVIMO2Batch (frames[-1] is the prediction frame)
     mask_hw   : (H, W) of the predicted mask
     depth_hw  : (h, w) of the predicted depth, or None to skip depth
     need_pose : build the relative camera motion between the last two frames
+    pseudo_store : PseudoLabelStore -> mask targets come from pseudo-labels
 
     All returned tensors are on CPU; the loss moves them to the device.
     """
     target = raw_batch.frames[-1]
 
-    gt_mask, mask_valid = build_gt_mask(target.mask, target.frame_motion, mask_hw)
+    if pseudo_store is not None:
+        # Training WITHOUT human mask labels: the true masks are not read here.
+        gt_mask, mask_valid = build_pseudo_mask(target, pseudo_store, mask_hw)
+    else:
+        gt_mask, mask_valid = build_gt_mask(target.mask, target.frame_motion, mask_hw)
     targets = {
         "gt_mask": gt_mask,
         "mask_valid": mask_valid,
@@ -86,7 +108,7 @@ def build_targets(raw_batch, mask_hw, depth_hw=None, need_pose=False) -> dict:
     if depth_hw is not None:
         depth_list = list(target.depth) if target.depth is not None else [None] * len(target.mask)
         gt_depth, depth_valid = build_gt_depth_batch(depth_list, target_hw=depth_hw, device=torch.device("cpu"))
-        targets["gt_depth"] = gt_depth / 1000 # EVIMO2 depth is in millimetres
+        targets["gt_depth"] = gt_depth / 1000.0   # EVIMO2 depth is in millimetres
         targets["depth_valid"] = depth_valid
 
     if need_pose and len(raw_batch.frames) >= 2:

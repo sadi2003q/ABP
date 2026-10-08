@@ -81,6 +81,9 @@ class TrainConfigSupervised:
     balance_dynamic_batches: bool = True
     min_dynamic_per_batch: int = 1
     event_dropout: float = 0.0
+    # ---- labels ----
+    label_source: str = "ground_truth"   # ground_truth | pseudo
+    pseudo_label_dir: str | None = None
     # ---- model ----
     use_imu: bool = True
     # ---- loss ----
@@ -196,6 +199,17 @@ class TrainerSupervised:
             f" | helper depth: {'on' if cfg.depth_weight > 0 else 'off'}"
             f" | helper pose: {'on' if cfg.pose_weight > 0 else 'off'}"
         )
+
+        # ---- labels ----
+        self.pseudo_store = None
+        if cfg.label_source == "pseudo":
+            from src.data.pseudo_labels import PseudoLabelStore
+            if not cfg.pseudo_label_dir:
+                raise ValueError("--label-source pseudo needs --pseudo-label-dir")
+            self.pseudo_store = PseudoLabelStore(cfg.pseudo_label_dir)
+            logger.info("TRAINING LABELS: PSEUDO-LABELS (true masks are used for evaluation only)")
+        else:
+            logger.info("TRAINING LABELS: ground-truth masks")
 
         # ---- data ----
         self.train_loader = train_loader
@@ -331,10 +345,19 @@ class TrainerSupervised:
 
         if cfg.balance_dynamic_batches:
             from src.data.concat_balanced_sampler import ConcatBalancedBatchSampler
+            is_dynamic = None
+            if self.pseudo_store is not None:
+                # Balance on PSEUDO-labels; the true masks must not steer training.
+                from src.data.pseudo_labels import target_frame_keys
+                keys = [k for tds in train_sets for k in target_frame_keys(tds)]
+                is_dynamic = [self.pseudo_store.has_positive(*k) for k in keys]
+                n_labelled = sum(self.pseudo_store.get(*k) is not None for k in keys[:: max(1, len(keys) // 200)])
+                logger.info(f"Pseudo-labels cover ~{100 * n_labelled / max(1, len(keys[:: max(1, len(keys) // 200)])):.0f}% "
+                            f"of training windows (sampled check).")
             self.train_sampler = ConcatBalancedBatchSampler(
                 train_sets, batch_size=cfg.batch_size,
                 min_dynamic_per_batch=cfg.min_dynamic_per_batch,
-                drop_last=True, seed=cfg.seed,
+                drop_last=True, seed=cfg.seed, is_dynamic=is_dynamic,
             )
             self.train_loader = self._loader(train_sets, shuffle=False, batch_sampler=self.train_sampler)
         else:
@@ -372,6 +395,13 @@ class TrainerSupervised:
             if i >= max_batches:
                 break
             last = raw.frames[-1]
+            if self.pseudo_store is not None:
+                for k in range(len(last.sequence_names)):
+                    lab = self.pseudo_store.get(last.sensors[k], last.sequence_names[k],
+                                                int(last.local_frame_indices[k]))
+                    if lab is not None:
+                        pos += float(lab.sum()); total += float(lab.size)
+                continue
             from src.models.supervised_model.targets import build_gt_mask
             # Native resolution is fine for a ratio.
             for m, fm in zip(last.mask, last.frame_motion):
@@ -410,6 +440,7 @@ class TrainerSupervised:
             mask_hw=tuple(outputs["mask"].shape[-2:]),
             depth_hw=depth_hw,
             need_pose=outputs.get("pose") is not None,
+            pseudo_store=self.pseudo_store,
         )
 
     # ------------------------------------------------------------------
