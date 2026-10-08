@@ -194,7 +194,10 @@ def main():
         return
 
     logging.info("=" * 70)
-    logging.info("SUPERVISED MOVING-OBJECT SEGMENTATION")
+    if cfg.label_source == "pseudo":
+        logging.info("SELF-SUPERVISED MOVING-OBJECT SEGMENTATION (trained on pseudo-labels, no human masks)")
+    else:
+        logging.info("SUPERVISED MOVING-OBJECT SEGMENTATION (trained on human-made ground-truth masks)")
     logging.info("=" * 70)
     TrainerSupervised(cfg).train()
 
