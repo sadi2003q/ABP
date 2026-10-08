@@ -102,13 +102,24 @@ def main():
                         handlers=[logging.StreamHandler(sys.stdout),
                                   logging.FileHandler(out / "refine.log")], force=True)
 
-    all_labels = load_all_labels(args.pseudo_label_dir)
+    src_dir = Path(args.pseudo_label_dir)
+    if not src_dir.is_dir():
+        raise FileNotFoundError(
+            f"Pseudo-label folder {src_dir} does not exist. If the Kaggle session restarted, "
+            f"/kaggle/working was wiped: run generate_pseudo_labels.py again first.")
+    found = sorted(str(f.relative_to(src_dir)) for f in src_dir.glob("*/*.npz"))
+    if not found:
+        raise RuntimeError(
+            f"{src_dir} exists but contains no <sensor>/<sequence>.npz label files "
+            f"(contents: {sorted(x.name for x in src_dir.iterdir())}).")
+    all_labels = load_all_labels(src_dir)
     if args.sensors:
         all_labels = {k: v for k, v in all_labels.items() if k[0] in args.sensors}
     if args.sequence:
         all_labels = {k: v for k, v in all_labels.items() if k[1] in args.sequence}
     if not all_labels:
-        raise RuntimeError(f"No pseudo-labels for sensors={args.sensors} in {args.pseudo_label_dir}")
+        raise RuntimeError(f"No pseudo-labels for sensors={args.sensors} / sequence={args.sequence} "
+                           f"in {src_dir}. Label files present: {found}")
     n_frames = sum(len(v) for v in all_labels.values())
     logger.info(f"Loaded {n_frames} pseudo-labels from {len(all_labels)} sequence(s)")
 
