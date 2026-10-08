@@ -34,6 +34,19 @@ def save_sequence_labels(pseudo_dir, sensor: str, sequence_name: str, labels: di
                         local_frame_indices=idx, packed=packed, shape=shape)
 
 
+def load_all_labels(pseudo_dir) -> dict[tuple[str, str], dict[int, np.ndarray]]:
+    """Every pseudo-label in a folder: {(sensor, sequence_name): {local_frame_index: bool (H, W)}}."""
+    out = {}
+    for f in sorted(Path(pseudo_dir).glob("*/*.npz")):
+        d = np.load(f)
+        H, W = (int(v) for v in d["shape"])
+        out[(f.parent.name, f.stem)] = {
+            int(i): np.unpackbits(row, count=H * W).reshape(H, W).astype(bool)
+            for i, row in zip(d["local_frame_indices"], d["packed"])
+        }
+    return out
+
+
 class PseudoLabelStore:
     """Read-only lookup: (sensor, sequence_name, local_frame_index) -> bool mask or None."""
 

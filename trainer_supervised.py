@@ -604,11 +604,8 @@ class TrainerSupervised:
             model.train()
         return r
 
-    def _final_report(self):
-        best_path = self.save_dir / "checkpoints" / "best.pth"
-        if self.eval_loader is None or not best_path.exists():
-            return
-        ckpt = torch.load(best_path, map_location=self.device, weights_only=False)
+    def _load_for_report(self, path):
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         model = SupervisedMotionSegmenter(
             num_bins=self.cfg.num_bins, num_frames=len(self.cfg.history_offsets),
             use_imu=self.cfg.use_imu, predict_depth=self.cfg.depth_weight > 0,
@@ -616,26 +613,67 @@ class TrainerSupervised:
         ).to(self.device)
         model.load_state_dict(ckpt["ema_state_dict"]["module"] if "ema_state_dict" in ckpt
                               else ckpt["model_state_dict"])
-        r = self.evaluate(self.eval_loader, model=model, per_sequence=True)
-        report = {
-            "evaluated_on": self.eval_tag,
-            "best_epoch": self.best_epoch,
+        return model, ckpt.get("epoch", -1) + 1
+
+    @staticmethod
+    def _summary(r, epoch):
+        return {
+            "epoch": epoch,
             "best_iou": r["best_iou"], "best_threshold": r["best_threshold"],
             "iou_at_0.5": r["iou_at_0.5"], "f1": r["best_f1"],
             "precision": r["best_precision"], "recall": r["best_recall"],
             "per_threshold": r["per_threshold"],
             "per_sequence": r.get("per_sequence", {}),
         }
+
+    def _final_report(self):
+        """
+        Evaluates BOTH checkpoints:
+          last.pth : the end of training. Its IoU at the fixed threshold 0.5
+                     involves no choice made with the evaluation masks, so it
+                     is the number to report.
+          best.pth : the epoch with the highest evaluation IoU. Choosing it
+                     uses the evaluation masks, so it is an optimistic upper
+                     bound unless the evaluation set is a separate split.
+        """
+        ckpt_dir = self.save_dir / "checkpoints"
+        if self.eval_loader is None:
+            return
+        results = {}
+        for name in ("last", "best"):
+            path = ckpt_dir / f"{name}.pth"
+            if path.exists():
+                model, epoch = self._load_for_report(path)
+                r = self.evaluate(self.eval_loader, model=model, per_sequence=True)
+                results[name] = self._summary(r, epoch)
+        if not results:
+            return
+
+        main = results.get("best") or results["last"]
+        report = {"evaluated_on": self.eval_tag, "best_epoch": self.best_epoch,
+                  **{k: v for k, v in main.items() if k != "epoch"},
+                  "last_epoch": results.get("last"), "best_checkpoint": results.get("best"),
+                  "selection_free_metric": "last_epoch.iou_at_0.5"}
         with open(self.save_dir / "final_metrics.json", "w") as f:
             json.dump(report, f, indent=2)
 
         logger.info("=" * 70)
-        logger.info(f"FINAL (best checkpoint, epoch {self.best_epoch}) on {self.eval_tag}")
-        logger.info(f"  IoU at best threshold ({r['best_threshold']:.2f}) : {r['best_iou']:.4f}")
-        logger.info(f"  IoU at threshold 0.50        : {r['iou_at_0.5']:.4f}")
-        logger.info(f"  F1                           : {r['best_f1']:.4f}")
-        for name, s in report["per_sequence"].items():
-            logger.info(f"  {name:40s} IoU={s['best_iou']:.4f}  IoU@0.5={s['iou_at_0.5']:.4f}")
+        logger.info(f"FINAL on {self.eval_tag}")
+        if "last" in results:
+            L = results["last"]
+            logger.info(f"  LAST EPOCH ({L['epoch']})  <- report this (no selection with evaluation masks)")
+            logger.info(f"    IoU at threshold 0.50        : {L['iou_at_0.5']:.4f}")
+            logger.info(f"    IoU at best threshold ({L['best_threshold']:.2f}) : {L['best_iou']:.4f}")
+            logger.info(f"    F1 / precision / recall      : {L['f1']:.4f} / {L['precision']:.3f} / {L['recall']:.3f}")
+            for seq, s in L["per_sequence"].items():
+                logger.info(f"    {seq:40s} IoU@0.5={s['iou_at_0.5']:.4f}  best IoU={s['best_iou']:.4f}")
+        if "best" in results:
+            B = results["best"]
+            note = "" if self.eval_tag not in ("train_overfit", "train_fallback") else \
+                "  (epoch chosen with evaluation masks: optimistic)"
+            logger.info(f"  BEST CHECKPOINT (epoch {B['epoch']}){note}")
+            logger.info(f"    IoU at threshold 0.50        : {B['iou_at_0.5']:.4f}")
+            logger.info(f"    IoU at best threshold ({B['best_threshold']:.2f}) : {B['best_iou']:.4f}")
         logger.info(f"  saved: {self.save_dir / 'final_metrics.json'}")
         logger.info("=" * 70)
 

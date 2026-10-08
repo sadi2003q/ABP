@@ -186,6 +186,31 @@ def test_band_helps_with_partial_labels(tmp):
         print("  NOTE: no gain from the band on this synthetic case (not an error; report it)")
 
 
+def test_temporal_refine():
+    from src.data.temporal_refine import refine_sequence
+    H, W = 60, 80
+
+    def square(x, y, size=10):
+        m = np.zeros((H, W), bool)
+        m[y:y + size, x:x + size] = True
+        return m
+
+    # A moving object (3 px per frame) in every frame, plus a one-frame flicker at frame 2
+    labels = {i: square(10 + 3 * i, 20) for i in range(5)}
+    labels[2] = labels[2] | square(60, 45, 6)
+    out = refine_sequence(labels, window=1, min_support=1, max_shift=15)
+    assert all(np.array_equal(out[i] & square(10 + 3 * i, 20), square(10 + 3 * i, 20)) for i in range(5)), \
+        "persistent moving object must be kept"
+    assert not out[2][45:51, 60:66].any(), "one-frame flicker must be removed"
+
+    # Object missed in frame 2: filled only when fill=True
+    gap = {i: square(10 + 3 * i, 20) for i in range(5)}
+    gap[2] = np.zeros((H, W), bool)
+    assert not refine_sequence(gap, fill=False)[2].any()
+    assert refine_sequence(gap, fill=True)[2].any(), "missed object should be filled from both neighbours"
+    print("  temporal refinement ................. ok")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)
     tmp = Path(tempfile.mkdtemp())
@@ -196,6 +221,7 @@ if __name__ == "__main__":
         test_training_uses_pseudo_labels_only(tmp)
         test_ignore_band_weight()
         test_loss_ignores_band()
+        test_temporal_refine()
         test_band_helps_with_partial_labels(tmp)
         print("ALL TESTS PASSED")
     finally:
