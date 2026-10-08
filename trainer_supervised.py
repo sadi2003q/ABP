@@ -84,6 +84,7 @@ class TrainConfigSupervised:
     # ---- labels ----
     label_source: str = "ground_truth"   # ground_truth | pseudo
     pseudo_label_dir: str | None = None
+    pseudo_ignore_band: int = 0          # pixels around each pseudo-labelled blob left out of the loss
     # ---- model ----
     use_imu: bool = True
     # ---- loss ----
@@ -108,7 +109,7 @@ class TrainConfigSupervised:
     ema_decay: float = 0.999
     # ---- evaluation / logging ----
     eval_every_n_epochs: int = 1
-    eval_thresholds: tuple = (0.3, 0.4, 0.5, 0.6, 0.7)
+    eval_thresholds: tuple = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
     select_metric: str = "best_iou"  # best_iou | iou_at_0.5
     early_stop_patience: int = 0     # evaluations without improvement; 0 = off
     checkpoint_every_n_epochs: int = 10
@@ -208,6 +209,8 @@ class TrainerSupervised:
                 raise ValueError("--label-source pseudo needs --pseudo-label-dir")
             self.pseudo_store = PseudoLabelStore(cfg.pseudo_label_dir)
             logger.info("TRAINING LABELS: PSEUDO-LABELS (true masks are used for evaluation only)")
+            logger.info(f"Ignore band around pseudo-labelled blobs: {cfg.pseudo_ignore_band} px"
+                        + (" (off)" if cfg.pseudo_ignore_band <= 0 else ""))
         else:
             logger.info("TRAINING LABELS: ground-truth masks")
 
@@ -441,6 +444,7 @@ class TrainerSupervised:
             depth_hw=depth_hw,
             need_pose=outputs.get("pose") is not None,
             pseudo_store=self.pseudo_store,
+            pseudo_ignore_band=self.cfg.pseudo_ignore_band,
         )
 
     # ------------------------------------------------------------------
@@ -642,7 +646,7 @@ class TrainerSupervised:
     def _log_step(self, epoch, batch_idx, steps_per_epoch, lo, grad_norm):
         gs = self.global_step
         for k in ("loss", "mask_loss", "bce_loss", "dice_loss", "depth_loss", "pose_loss",
-                  "pred_dynamic_ratio", "gt_dynamic_ratio"):
+                  "pred_dynamic_ratio", "gt_dynamic_ratio", "ignored_fraction"):
             v = lo.get(k)
             if isinstance(v, torch.Tensor):
                 self.writer.add_scalar(f"train/{k}", v.item(), gs)

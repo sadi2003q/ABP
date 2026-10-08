@@ -27,8 +27,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def batch_soft_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
+def batch_soft_dice_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1.0,
+                         weight: torch.Tensor | None = None) -> torch.Tensor:
+    """Batch-global soft Dice. Pixels with weight 0 are ignored entirely."""
     probs = torch.sigmoid(logits)
+    if weight is not None:
+        probs = probs * weight
+        target = target * weight
     intersection = (probs * target).sum()
     denominator = probs.sum() + target.sum()
     return 1.0 - (2.0 * intersection + eps) / (denominator + eps)
@@ -84,9 +89,18 @@ class SupervisedLoss(nn.Module):
             pw = None
             if self.pos_weight is not None:
                 pw = torch.tensor(self.pos_weight, device=device, dtype=torch.float32)
-            bce = F.binary_cross_entropy_with_logits(logits, gt, pos_weight=pw)
+            w = targets.get("mask_weight")
+            if w is not None:
+                # Pseudo-label training: weight-0 pixels are "unknown" and
+                # take no part in either loss term.
+                w = w.to(device)[mv].float()
+                per_pixel = F.binary_cross_entropy_with_logits(logits, gt, pos_weight=pw, reduction="none")
+                bce = (per_pixel * w).sum() / w.sum().clamp_min(1.0)
+                result["ignored_fraction"] = (1.0 - w.mean()).detach()
+            else:
+                bce = F.binary_cross_entropy_with_logits(logits, gt, pos_weight=pw)
             if gt.sum() > 0:
-                dice = batch_soft_dice_loss(logits, gt)
+                dice = batch_soft_dice_loss(logits, gt, weight=w)
             else:
                 dice = zero
             result["pred_dynamic_ratio"] = torch.sigmoid(logits).mean().detach()

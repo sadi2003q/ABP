@@ -75,6 +75,10 @@ def main():
                    help="Train on true masks, or on pseudo-labels from generate_pseudo_labels.py. "
                         "Evaluation always uses the true masks.")
     g.add_argument("--pseudo-label-dir", type=str, default=None)
+    g.add_argument("--pseudo-ignore-band", type=int, default=0,
+                   help="Pixels around each pseudo-labelled blob treated as 'unknown' (left out "
+                        "of the loss), so the model may extend objects the labels only partly "
+                        "cover. Pseudo-label mode only. 0 = off.")
 
     g = p.add_argument_group("model")
     g.add_argument("--no-imu", action="store_true", help="Events only, no inertial input.")
@@ -151,6 +155,7 @@ def main():
         event_dropout=args.event_dropout,
         label_source=args.label_source,
         pseudo_label_dir=args.pseudo_label_dir,
+        pseudo_ignore_band=args.pseudo_ignore_band,
         use_imu=not args.no_imu,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
