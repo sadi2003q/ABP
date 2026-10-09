@@ -21,6 +21,13 @@ Note: choosing the setting by looking at that report uses the true
 masks of the sequence being labelled. For a paper, choose it on a
 different sequence than the one you evaluate on.
 
+Where the camera motion in step 1 comes from (--geometry):
+    mocap         motion-capture depth + pose (stage A)
+    imu_rotation  gyroscope rotation only (stage B0)
+    events        background flow fitted to the events alone (stage B1;
+                  no other sensor; depth/pose loaded only for the report)
+    none          no compensation (baseline)
+
 Usage
 -----
 python generate_pseudo_labels.py \
@@ -49,11 +56,26 @@ from src.data.pseudo_labels import save_sequence_labels
 from src.data.imu_rotation import (
     integrate_gyro, rotation_from_imu, rotation_angle_deg, FrameForCalibration, calibrate_axes,
 )
+from src.data.event_flow import MODELS as FLOW_MODELS, fit_background_flow, flow_field
 
 logger = logging.getLogger("generate_pseudo_labels")
 
 GRID_THRESHOLDS = (0.2, 0.3, 0.4)
 GRID_MIN_AREAS = (0.001, 0.003, 0.01)
+
+GEOMETRY_DESCRIPTION = {
+    "mocap": "motion-capture depth + pose (stage A)",
+    "imu_rotation": "gyroscope rotation only, axes found from event sharpness (stage B0)",
+    "events": "background flow fitted to the events alone (stage B1)",
+    "none": "no motion compensation (baseline)",
+}
+
+
+def score_from_flow(xy, t, t0, t1, flow):
+    """Contrast score map after undoing the background displacement `flow` (H, W, 2)."""
+    H, W = flow.shape[:2]
+    xw, yw, alpha = compensate(xy, t, t0, t1, flow)
+    return scores_from_warped(xw, yw, alpha, H, W)["contrast"]
 
 
 def pseudo_score(xy, t, t0, t1, K, dist, R, trans, depth, H=None, W=None, mode="full"):
@@ -62,8 +84,7 @@ def pseudo_score(xy, t, t0, t1, K, dist, R, trans, depth, H=None, W=None, mode="
     if depth is not None:
         H, W = depth.shape
     flow = ego_flow(H, W, K, dist, R, trans, depth=depth, mode=mode)
-    xw, yw, alpha = compensate(xy, t, t0, t1, flow)
-    return scores_from_warped(xw, yw, alpha, H, W)["contrast"]
+    return score_from_flow(xy, t, t0, t1, flow)
 
 
 def score_to_label(score, threshold, min_area_fraction, close_radius=5):
@@ -134,7 +155,7 @@ def _calibrate_imu_axes(ds, refs, args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Stage A: pseudo-labels from motion compensation")
+    p = argparse.ArgumentParser(description="Pseudo-labels from motion compensation (stages A, B0, B1)")
     p.add_argument("--dataset-root", required=True)
     p.add_argument("--sensors", nargs="+", default=["left_camera"])
     p.add_argument("--subset", default="imo")
@@ -145,10 +166,19 @@ def main():
                    help="Smallest blob kept, as a fraction of the image area.")
     p.add_argument("--out-dir", required=True)
     g = p.add_argument_group("geometry")
-    g.add_argument("--geometry", choices=["mocap", "imu_rotation"], default="mocap",
+    g.add_argument("--geometry", choices=["mocap", "imu_rotation", "events", "none"], default="mocap",
                    help="mocap: motion-capture depth + camera pose (stage A). "
                         "imu_rotation: camera rotation from the camera's own gyroscope only, "
-                        "no depth, no translation, no motion capture (stage B0).")
+                        "no depth, no translation, no motion capture (stage B0). "
+                        "events: background flow fitted to each window's events alone, no other "
+                        "sensor (stage B1). none: no compensation at all (baseline).")
+    g.add_argument("--flow-model", choices=sorted(FLOW_MODELS), default="planar",
+                   help="--geometry events: background flow formula (translation: 2 numbers, "
+                        "affine: 6, planar: 8). See src/data/event_flow.py.")
+    g.add_argument("--flow-max-events", type=int, default=80_000,
+                   help="--geometry events: events used per window to fit the flow (random subsample).")
+    p.add_argument("--limit-frames", type=int, default=0,
+                   help="Stop after this many labelled frames (0 = all). For a quick check.")
     g.add_argument("--imu-axes", type=float, nargs=9, default=None,
                    help="Fixed 3x3 inertial-to-camera axis matrix (row-major). "
                         "Default: found automatically from event sharpness.")
@@ -157,7 +187,8 @@ def main():
     g.add_argument("--height", type=int, default=480)
     g.add_argument("--width", type=int, default=640)
     args = p.parse_args()
-    use_imu = args.geometry == "imu_rotation"
+    geometry = args.geometry
+    use_imu = geometry == "imu_rotation"
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -168,8 +199,9 @@ def main():
     from src.data.dataset import EVIMO2Dataset
     from src.utils.metrics import get_dynamic_object_ids, evimo2_mask_to_binary_dynamic
 
+    # events: depth is loaded ONLY for the motion-capture comparison in the report
     ds = EVIMO2Dataset(dataset_root=args.dataset_root, sensors=tuple(args.sensors),
-                       split=args.split, load_depth=not use_imu, load_mask=True,
+                       split=args.split, load_depth=geometry in ("mocap", "events"), load_mask=True,
                        subset=args.subset, sequence=args.sequence)
     refs = ds.index.references
 
@@ -181,52 +213,91 @@ def main():
     chosen = Pooled()
     labels_by_seq: dict[tuple, dict[int, np.ndarray]] = {}
     n_written, n_skipped, t_start = 0, 0, time.time()
+    prev_theta: dict[tuple, np.ndarray] = {}        # events: previous window's flow, as a starting guess
+    fit_stats = {"gain": [], "at_bound": 0, "not_fitted": 0}
+    flow_check = {"error_px": [], "mocap_px": []}    # events: report only
 
     for i in range(len(ds) - 1):
         if refs[i].sequence_id != refs[i + 1].sequence_id:
             continue
+        if args.limit_frames and n_written >= args.limit_frames:
+            break
         a, b = ds[i], ds[i + 1]
-        if use_imu:
+        K = np.asarray(a.camera_intrinsics, np.float64)
+        dist = np.asarray(a.camera_distortion, np.float64)
+        xy = np.asarray(a.events_xy)
+        t = np.asarray(a.events_t, np.float64)
+
+        gt = None
+        if a.mask is not None:        # quality report only
+            gt = evimo2_mask_to_binary_dynamic(a.mask, get_dynamic_object_ids(a.frame_motion)).numpy()
+            while gt.ndim > 2:
+                gt = gt[0]
+            gt = gt.astype(bool)
+
+        if geometry == "imu_rotation":
             theta = integrate_gyro(a.imu.timestamps, a.imu.angular_velocity, a.timestamp, b.timestamp)
             if theta is None:
                 n_skipped += 1
                 continue
             R = rotation_from_imu(theta, imu_axes[a.sensor])
-            trans, depth, mode = np.zeros(3), None, "rotation"
             H, W = args.height, args.width
             if a.camera_motion.pose_available and b.camera_motion.pose_available:
                 # report only: how close the gyroscope rotation is to motion capture
                 R_mc, _ = relative_pose(a.camera_motion, b.camera_motion)
                 mocap_check.setdefault("error_deg", []).append(rotation_angle_deg(R.T @ R_mc))
                 mocap_check.setdefault("mocap_deg", []).append(rotation_angle_deg(R_mc))
-        else:
+            flow = ego_flow(H, W, K, dist, R, np.zeros(3), depth=None, mode="rotation")
+        elif geometry == "mocap":
             if a.depth is None or not (a.camera_motion.pose_available and b.camera_motion.pose_available):
                 n_skipped += 1
                 continue
             depth = _depth_in_metres(a.depth)
             R, trans = relative_pose(a.camera_motion, b.camera_motion)
-            mode = "full"
             H, W = depth.shape
-        xy = np.asarray(a.events_xy)
-        t = np.asarray(a.events_t, np.float64)
+            flow = ego_flow(H, W, K, dist, R, trans, depth=depth, mode="full")
+        elif geometry == "events":
+            H, W = args.height, args.width
+            key = (a.sensor, a.sequence_name)
+            theta, info = fit_background_flow(xy, t, a.timestamp, b.timestamp, H, W,
+                                              model=args.flow_model, init=prev_theta.get(key),
+                                              max_events=args.flow_max_events, seed=i)
+            if info["fitted"]:
+                prev_theta[key] = theta
+                fit_stats["gain"].append(info["gain"])
+                fit_stats["at_bound"] += int(info["at_bound"])
+            else:
+                fit_stats["not_fitted"] += 1
+            flow = flow_field(theta, H, W, args.flow_model)
+            # report only: compare with the motion-capture background flow on static pixels
+            if (a.depth is not None and a.camera_motion.pose_available and b.camera_motion.pose_available
+                    and np.asarray(a.depth).shape[-2:] == (H, W)):
+                depth = _depth_in_metres(a.depth)
+                while depth.ndim > 2:
+                    depth = depth[0]
+                R_mc, t_mc = relative_pose(a.camera_motion, b.camera_motion)
+                flow_mc = ego_flow(H, W, K, dist, R_mc, t_mc, depth=depth, mode="full")
+                valid = np.isfinite(depth) & (depth > 0.05) & (depth < 20.0)
+                if gt is not None:
+                    valid &= ~gt
+                if valid.sum() > 100:
+                    flow_check["error_px"].append(float(np.median(np.linalg.norm(flow - flow_mc, axis=2)[valid])))
+                    flow_check["mocap_px"].append(float(np.median(np.linalg.norm(flow_mc, axis=2)[valid])))
+        else:   # none
+            H, W = args.height, args.width
+            flow = np.zeros((H, W, 2), np.float32)
+
         if len(t) == 0:
             label = np.zeros((H, W), bool)
             score = np.zeros((H, W))
         else:
-            score = pseudo_score(xy, t, a.timestamp, b.timestamp,
-                                 np.asarray(a.camera_intrinsics, np.float64),
-                                 np.asarray(a.camera_distortion, np.float64), R, trans, depth,
-                                 H=H, W=W, mode=mode)
+            score = score_from_flow(xy, t, a.timestamp, b.timestamp, flow)
             label = score_to_label(score, args.threshold, args.min_area)
 
         labels_by_seq.setdefault((a.sensor, a.sequence_name), {})[int(a.local_frame_index)] = label
         n_written += 1
 
-        if a.mask is not None:        # quality report only
-            gt = evimo2_mask_to_binary_dynamic(a.mask, get_dynamic_object_ids(a.frame_motion)).numpy()
-            while gt.ndim > 2:
-                gt = gt[0]
-            gt = gt.astype(bool)
+        if gt is not None:            # quality report only
             chosen.update(label, gt)
             for (thr, area), pooled in grid.items():
                 pooled.update(score_to_label(score, thr, area) if len(t) else label, gt)
@@ -238,16 +309,41 @@ def main():
     for (sensor, seq), labels in labels_by_seq.items():
         save_sequence_labels(out, sensor, seq, labels)
 
-    skip_reason = "no gyroscope samples" if use_imu else "no depth/pose"
+    skip_reason = {"imu_rotation": "no gyroscope samples", "mocap": "no depth/pose"}.get(geometry, "none expected")
     logger.info(f"Pseudo-labels written: {n_written} frames | skipped ({skip_reason}): {n_skipped}")
     if mocap_check.get("error_deg"):
         logger.info(f"Gyroscope vs motion-capture rotation (report only): median error "
                     f"{np.median(mocap_check['error_deg']):.3f} deg per frame, while the camera "
                     f"rotates {np.median(mocap_check['mocap_deg']):.3f} deg per frame (median)")
+    if geometry == "events":
+        if fit_stats["gain"]:
+            logger.info(f"Event-fitted background flow ({args.flow_model}): sharpness x"
+                        f"{np.median(fit_stats['gain']):.3f} vs no compensation (median over "
+                        f"{len(fit_stats['gain'])} windows) | windows with a parameter at its limit: "
+                        f"{fit_stats['at_bound']} | windows too sparse to fit: {fit_stats['not_fitted']}")
+        if flow_check["error_px"]:
+            logger.info(f"Event-fitted vs motion-capture background flow (report only, static pixels): "
+                        f"median error {np.median(flow_check['error_px']):.2f} px per window, while the "
+                        f"background moves {np.median(flow_check['mocap_px']):.2f} px per window (median)")
+        else:
+            logger.info("Event-fitted vs motion-capture background flow: no frames with depth + pose "
+                        "at the event image size, comparison skipped")
     report = {
-        "settings": {"threshold": args.threshold, "min_area": args.min_area, "geometry": ("gyroscope rotation only, axes found from event sharpness (stage B0)" if use_imu
-                                 else "motion-capture depth + pose (stage A)")},
+        "settings": {"threshold": args.threshold, "min_area": args.min_area,
+                     "geometry": GEOMETRY_DESCRIPTION[geometry],
+                     "flow_model": args.flow_model if geometry == "events" else None,
+                     "limit_frames": args.limit_frames},
         "imu_calibration": calib_report,
+        "event_flow": ({
+            "median_sharpness_gain": float(np.median(fit_stats["gain"])) if fit_stats["gain"] else None,
+            "windows_with_parameter_at_limit": fit_stats["at_bound"],
+            "windows_too_sparse": fit_stats["not_fitted"],
+        } if geometry == "events" else None),
+        "event_flow_vs_mocap_report_only": ({
+            "frames": len(flow_check["error_px"]),
+            "median_error_px": float(np.median(flow_check["error_px"])),
+            "median_mocap_flow_px": float(np.median(flow_check["mocap_px"])),
+        } if flow_check["error_px"] else None),
         "imu_vs_mocap_rotation_report_only": ({
             "frames": len(mocap_check.get("error_deg", [])),
             "median_error_deg": float(np.median(mocap_check["error_deg"])),
