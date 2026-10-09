@@ -133,7 +133,7 @@ Measured on the right-camera sequence (`selfsup_signal_check.py`):
 flowchart LR
     A["Signal check<br/>done"] --> B["Stage A<br/>motion-capture geometry<br/>0.55, done"]
     B --> C["Stage B0<br/>gyroscope rotation only<br/>labels 0.11, stopped"]
-    C --> D["Stage B1<br/>background flow fitted<br/>to the events alone<br/>labels 0.30, training next"]
+    C --> D["Stage B1<br/>background flow fitted<br/>to the events alone<br/>network 0.45, done"]
     D --> E["Stage B2<br/>learned depth + translation<br/>planned"]
     E --> F["Full dataset,<br/>held-out sequences<br/>planned"]
     F --> G["Comparison with<br/>published methods"]
@@ -168,6 +168,13 @@ gyroscope cannot measure. This motivated B1.
 The fitted background flow differs from the motion-capture flow by 0.61 px per
 window (median) while the background moves 1.36 px per window, and it sharpens
 the events by a median ×1.053 over no compensation. No other sensor is used.
+
+After temporal refinement (window 1, at least 2 supporting neighbours) the B1
+labels score 0.313, with false blobs in only 6 of 307 object-free windows. The
+segmentation network trained on them (8 epochs, 20-pixel ignore band) reaches
+**IoU 0.454 at threshold 0.50 at the last epoch**, against 0.55 for stage A.
+In both stages the network scores about 1.45 times its training labels.
+Both are scored on the training frames of this one sequence.
 
 ### Stage A / B pipeline in detail
 
