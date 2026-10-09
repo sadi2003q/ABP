@@ -28,6 +28,19 @@ parameter is in pixels):
 Sharpness = variance of the blurred image of warped events. Its exact
 gradient with respect to the parameters is computed analytically, so
 each fit takes a few dozen image evaluations.
+
+Protection against "event collapse" (a known failure: a zoom-capable
+flow can squeeze all events towards one point, which looks very sharp
+but is meaningless):
+  * sharpness is measured with events warped to the MIDDLE of the
+    window, so squeezing the early events means stretching the late
+    ones and collapse no longer pays off;
+  * the zoom-like (linear and quadratic) terms are limited to a small
+    fraction of the image size;
+  * the whole-image shift is fitted first; the other terms are only
+    then allowed to refine it.
+The fitted numbers still describe the displacement over the WHOLE
+window, so the flow is used exactly like the other geometries.
 """
 
 from __future__ import annotations
@@ -38,12 +51,13 @@ from scipy.optimize import minimize
 
 MODELS = {"translation": 2, "affine": 6, "planar": 8}
 
-# Limits on the parameters (pixels over one window). They stop the
-# optimiser from "collapsing" events into a point by an extreme zoom,
-# a known failure of sharpness maximisation with zoom-capable models.
+# Limits on the parameters over one window. The shift limit is in pixels;
+# the zoom-like limits are fractions of half the larger image side (s):
+# a linear term of 0.1*s is a 10 % stretch / rotation per window, far more
+# than real background motion between neighbouring frames.
 TRANSLATION_LIMIT = 64.0
-LINEAR_LIMIT = 40.0
-QUADRATIC_LIMIT = 24.0
+LINEAR_LIMIT_FRACTION = 0.10
+QUADRATIC_LIMIT_FRACTION = 0.05
 
 
 def _normalised(x, y, H, W):
@@ -73,14 +87,21 @@ def _vertical_shift_index(model):
     return 1 if model == "translation" else 3
 
 
-def _bounds(model):
+def _bounds(model, H, W):
+    T = (-TRANSLATION_LIMIT, TRANSLATION_LIMIT)
     if model == "translation":
-        return [(-TRANSLATION_LIMIT, TRANSLATION_LIMIT)] * 2
-    lin = [(-TRANSLATION_LIMIT, TRANSLATION_LIMIT), (-LINEAR_LIMIT, LINEAR_LIMIT), (-LINEAR_LIMIT, LINEAR_LIMIT)]
-    b = lin + lin
+        return [T, T]
+    s = max(H, W) / 2.0
+    L = (-LINEAR_LIMIT_FRACTION * s, LINEAR_LIMIT_FRACTION * s)
+    b = [T, L, L, T, L, L]
     if model == "planar":
-        b += [(-QUADRATIC_LIMIT, QUADRATIC_LIMIT)] * 2
+        Q = (-QUADRATIC_LIMIT_FRACTION * s, QUADRATIC_LIMIT_FRACTION * s)
+        b += [Q, Q]
     return b
+
+
+def _clip(theta, bounds):
+    return np.clip(np.asarray(theta, np.float64), [b[0] for b in bounds], [b[1] for b in bounds])
 
 
 def flow_field(theta, H, W, model) -> np.ndarray:
@@ -145,7 +166,11 @@ def _sharpness_and_position_gradient(x, y, H, W, sigma):
 
 
 class _Problem:
-    """Events of one window, prepared so each parameter guess is cheap to score."""
+    """
+    Events of one window, prepared so each parameter guess is cheap to score.
+    alpha = how far along the warp each event is moved (fit: event time
+    fraction minus 0.5, i.e. warped to the middle of the window).
+    """
 
     def __init__(self, x, y, alpha, H, W, model):
         self.x, self.y, self.alpha = x, y, alpha
@@ -184,10 +209,13 @@ def fit_background_flow(
     """
     Fit the background flow of one window from its events.
 
-    1. Coarse search: try whole-image shifts on a grid (and `init`, e.g.
-       the previous frame's answer) on a subsample, with a wide blur.
-    2. Refine all parameters by gradient ascent on sharpness, first with
-       a wide blur (smooth, forgiving), then a narrow blur (precise).
+    1. Whole-image shift: coarse grid search on a subsample with a wide
+       blur, then gradient refinement (wide blur, then narrow blur).
+    2. Other models: start from that shift (or from `init`, e.g. the
+       previous window's answer, if it is sharper) and refine all
+       parameters the same way.
+    Sharpness is always measured with events warped to the middle of the
+    window (see the module notes on event collapse).
 
     Returns (theta, info). info["gain"] = sharpness with the fitted flow
     divided by sharpness with no compensation (narrow blur; >1 = sharper).
@@ -197,43 +225,50 @@ def fit_background_flow(
     t = np.asarray(t, np.float64)
     n = len(t)
     if n < 200:
-        return np.zeros(P), {"fitted": False, "events": n, "gain": 1.0, "at_bound": False}
+        return np.zeros(P), {"fitted": False, "events": n, "gain": 1.0, "at_bound": False,
+                             "started_from_previous": False}
 
     order = np.random.default_rng(seed).permutation(n)[:max_events]   # random order: any prefix is a fair subsample
     x, y = xy[order, 0], xy[order, 1]
-    alpha = np.clip((t[order] - t0) / max(t1 - t0, 1e-9), 0.0, 1.0)
-    prob = _Problem(x, y, alpha, H, W, model)
-    bounds = _bounds(model)
+    to_middle = np.clip((t[order] - t0) / max(t1 - t0, 1e-9), 0.0, 1.0) - 0.5
 
-    # ---- 1. coarse search over whole-image shifts ----
-    iv = _vertical_shift_index(model)
+    def refine(prob, theta, bounds):
+        for sigma in sigmas:
+            ref = max(prob.sharpness(theta, sigma), 1e-12)   # scale so the objective starts at -1
+
+            def fun(th, sigma=sigma, ref=ref):
+                V, g = prob.value_and_gradient(th, sigma)
+                return -V / ref, -g / ref
+
+            res = minimize(fun, theta, jac=True, method="L-BFGS-B", bounds=bounds,
+                           options={"maxiter": max_iter})
+            if np.all(np.isfinite(res.x)) and -res.fun >= 1.0:
+                theta = res.x
+        return theta
+
+    # ---- 1. whole-image shift ----
+    prob_t = _Problem(x, y, to_middle, H, W, "translation")
+    bounds_t = _bounds("translation", H, W)
     r = np.arange(-search_radius, search_radius + 1e-9, search_step)
-    candidates = []
-    for dy in r:
-        for dx in r:
-            th = np.zeros(P)
-            th[0], th[iv] = dx, dy
-            candidates.append(th)
-    if init is not None and len(init) == P and np.all(np.isfinite(init)):
-        candidates.append(np.clip(np.asarray(init, np.float64),
-                                  [b[0] for b in bounds], [b[1] for b in bounds]))
+    grid = [np.array([dx, dy]) for dy in r for dx in r]
     m = min(search_events, len(x))
-    scores = [prob.sharpness(th, sigmas[0], n=m) for th in candidates]
-    theta = candidates[int(np.argmax(scores))].copy()
-    started_from_init = init is not None and int(np.argmax(scores)) == len(candidates) - 1
+    shift = grid[int(np.argmax([prob_t.sharpness(th, sigmas[0], n=m) for th in grid]))].copy()
+    shift = refine(prob_t, _clip(shift, bounds_t), bounds_t)
 
-    # ---- 2. refine: wide blur, then narrow blur ----
-    for sigma in sigmas:
-        ref = max(prob.sharpness(theta, sigma), 1e-12)   # scale so the objective is ~1
-
-        def fun(th, sigma=sigma, ref=ref):
-            V, g = prob.value_and_gradient(th, sigma)
-            return -V / ref, -g / ref
-
-        res = minimize(fun, theta, jac=True, method="L-BFGS-B", bounds=bounds,
-                       options={"maxiter": max_iter})
-        if np.all(np.isfinite(res.x)) and -res.fun >= 1.0:
-            theta = res.x
+    # ---- 2. full model, starting from the shift ----
+    started_from_init = False
+    if model == "translation":
+        prob, bounds, theta = prob_t, bounds_t, shift
+    else:
+        prob = _Problem(x, y, to_middle, H, W, model)
+        bounds = _bounds(model, H, W)
+        theta = np.zeros(P)
+        theta[0], theta[_vertical_shift_index(model)] = shift
+        if init is not None and len(init) == P and np.all(np.isfinite(init)):
+            init_c = _clip(init, bounds)
+            if prob.sharpness(init_c, sigmas[0]) > prob.sharpness(theta, sigmas[0]):
+                theta, started_from_init = init_c, True
+        theta = refine(prob, theta, bounds)
 
     final_sigma = sigmas[-1]
     base = max(prob.sharpness(np.zeros(P), final_sigma), 1e-12)
