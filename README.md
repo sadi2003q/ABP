@@ -133,7 +133,7 @@ Measured on the right-camera sequence (`selfsup_signal_check.py`):
 flowchart LR
     A["Signal check<br/>done"] --> B["Stage A<br/>motion-capture geometry<br/>0.55, done"]
     B --> C["Stage B0<br/>gyroscope rotation only<br/>labels 0.11, stopped"]
-    C --> D["Stage B1<br/>background flow fitted<br/>to the events alone<br/>in progress"]
+    C --> D["Stage B1<br/>background flow fitted<br/>to the events alone<br/>labels 0.30, training next"]
     D --> E["Stage B2<br/>learned depth + translation<br/>planned"]
     E --> F["Full dataset,<br/>held-out sequences<br/>planned"]
     F --> G["Comparison with<br/>published methods"]
@@ -155,6 +155,19 @@ almost nothing and the gyroscope-to-camera axes could not be identified (the
 best and second-best of the 48 arrangements were tied, margin 1.001). Most
 background motion in this sequence comes from camera translation, which a
 gyroscope cannot measure. This motivated B1.
+
+**B1 result (same sequence and settings, threshold 0.4, smallest object 1 %):**
+
+| Geometry used for compensation | Pseudo-label IoU | Object-free windows with false blobs |
+|---|---|---|
+| None (baseline) | 0.081 | 146 / 307 |
+| B0: gyroscope rotation | 0.110 | 138 / 307 |
+| **B1: background flow fitted to the events alone** | **0.304** | **37 / 307** |
+| A: motion-capture depth and pose | 0.38 | |
+
+The fitted background flow differs from the motion-capture flow by 0.61 px per
+window (median) while the background moves 1.36 px per window, and it sharpens
+the events by a median ×1.053 over no compensation. No other sensor is used.
 
 ### Stage A / B pipeline in detail
 
