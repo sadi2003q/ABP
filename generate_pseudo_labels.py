@@ -71,11 +71,123 @@ GEOMETRY_DESCRIPTION = {
 }
 
 
-def score_from_flow(xy, t, t0, t1, flow):
-    """Contrast score map after undoing the background displacement `flow` (H, W, 2)."""
+def score_from_flow(xy, t, t0, t1, flow, t_ref=None):
+    """Contrast score map after undoing the background displacement `flow` (H, W, 2).
+    `flow` is the displacement over the whole window [t0, t1].
+    t_ref = None: events are warped to t0 (old behaviour).
+    t_ref given:  events are warped to t_ref (e.g. the labelled frame in the
+                  middle of a multi-frame window)."""
     H, W = flow.shape[:2]
-    xw, yw, alpha = compensate(xy, t, t0, t1, flow)
+    if t_ref is None:
+        xw, yw, alpha = compensate(xy, t, t0, t1, flow)
+    else:
+        xw, yw, alpha = compensate_to_time(xy, t, t0, t1, t_ref, flow)
     return scores_from_warped(xw, yw, alpha, H, W)["contrast"]
+
+
+def compensate_to_time(xy, t, t0, t1, t_ref, flow):
+    """Warp events to the time t_ref (anywhere inside [t0, t1]).
+    With t_ref = t0 this gives exactly the same result as compensate()."""
+    # Step 1: image size, e.g. H = 480, W = 640
+    H, W = flow.shape[:2]
+
+    # Step 2: length of the whole window in seconds, e.g. 0.083
+    duration = max(t1 - t0, 1e-9)
+
+    # Step 3: signed fraction of the window between each event and t_ref
+    #         negative = event before t_ref, positive = after it
+    #         e.g. t_ref in the middle -> values between -0.5 and +0.5
+    alpha = (t - t_ref) / duration
+    lowest = (t0 - t_ref) / duration
+    highest = (t1 - t_ref) / duration
+    alpha = np.clip(alpha, lowest, highest)
+
+    # Step 4: event pixel positions
+    x = xy[:, 0].astype(np.float64)
+    y = xy[:, 1].astype(np.float64)
+
+    # Step 5: background displacement at each event's pixel
+    x_pixel = np.clip(np.round(x).astype(int), 0, W - 1)
+    y_pixel = np.clip(np.round(y).astype(int), 0, H - 1)
+    displacement = flow[y_pixel, x_pixel]
+
+    # Step 6: move each event back (or forward) to where it was at t_ref
+    x_warped = x - alpha * displacement[:, 0]
+    y_warped = y - alpha * displacement[:, 1]
+    return x_warped, y_warped, alpha
+
+
+def get_sample(ds, index, cache):
+    """Load frame `index` from the dataset, or reuse it if already loaded."""
+    # Step 1: load it only the first time it is needed
+    if index not in cache:
+        cache[index] = ds[index]
+    return cache[index]
+
+
+def drop_old_samples(cache, keep_from):
+    """Forget loaded frames with an index below `keep_from` (saves memory)."""
+    # Step 1: find the old indices
+    old_indices = [index for index in cache if index < keep_from]
+
+    # Step 2: remove them
+    for index in old_indices:
+        del cache[index]
+
+
+def gather_window(ds, refs, i, half, cache):
+    """
+    Events of the frames i-half ... i+half (all in the same sequence).
+
+    Returns None when the window would leave the sequence (first/last
+    frames of a sequence), otherwise a dictionary with:
+      xy, t          all events of the window
+      t_start, t_end start and end time of the window
+      first, end     the first frame and the frame right after the last one
+                     (used only for the motion-capture comparison in the report)
+    With half = 0 this is exactly frame i's own window (old behaviour).
+    """
+    # Step 1: frame indices, e.g. i = 10, half = 2 -> frames 8, 9, 10, 11, 12
+    first_index = i - half
+    last_index = i + half
+
+    # Step 2: we also need the frame after the last one (its time = window end)
+    after_last_index = last_index + 1
+
+    # Step 3: the window must stay inside the dataset
+    if first_index < 0 or after_last_index >= len(refs):
+        return None
+
+    # Step 4: every frame must come from the same sequence as frame i
+    sequence_id = refs[i].sequence_id
+    for j in range(first_index, after_last_index + 1):
+        if refs[j].sequence_id != sequence_id:
+            return None
+
+    # Step 5: collect the events of every frame in the window
+    xy_parts = []
+    t_parts = []
+    for j in range(first_index, last_index + 1):
+        sample = get_sample(ds, j, cache)
+        xy_parts.append(np.asarray(sample.events_xy).reshape(-1, 2))
+        t_parts.append(np.asarray(sample.events_t, np.float64).reshape(-1))
+
+    # Step 6: join them into one list of events
+    xy = np.concatenate(xy_parts, axis=0)
+    t = np.concatenate(t_parts, axis=0)
+
+    # Step 7: start and end time of the window
+    first_sample = get_sample(ds, first_index, cache)
+    end_sample = get_sample(ds, after_last_index, cache)
+
+    return {
+        "xy": xy,
+        "t": t,
+        "t_start": first_sample.timestamp,
+        "t_end": end_sample.timestamp,
+        "first": first_sample,
+        "end": end_sample,
+    }
 
 
 def pseudo_score(xy, t, t0, t1, K, dist, R, trans, depth, H=None, W=None, mode="full"):
@@ -177,6 +289,11 @@ def main():
                         "affine: 6, planar: 8). See src/data/event_flow.py.")
     g.add_argument("--flow-max-events", type=int, default=80_000,
                    help="--geometry events: events used per window to fit the flow (random subsample).")
+    p.add_argument("--window-frames", type=int, default=1,
+                   help="Odd number of frames whose events are used for each label, centred on the "
+                        "labelled frame (--geometry events / none only). 1 = old behaviour.")
+    p.add_argument("--frame-step", type=int, default=1,
+                   help="Label only every N-th frame (quick checks only; refinement needs every frame).")
     p.add_argument("--limit-frames", type=int, default=0,
                    help="Stop after this many labelled frames (0 = all). For a quick check.")
     g.add_argument("--imu-axes", type=float, nargs=9, default=None,
@@ -189,6 +306,13 @@ def main():
     args = p.parse_args()
     geometry = args.geometry
     use_imu = geometry == "imu_rotation"
+    if args.window_frames < 1 or args.window_frames % 2 == 0:
+        p.error("--window-frames must be an odd number (1, 3, 5, ...)")
+    if args.window_frames > 1 and geometry not in ("events", "none"):
+        p.error("--window-frames > 1 is only supported with --geometry events or none")
+    if args.frame_step < 1:
+        p.error("--frame-step must be 1 or more")
+    half = args.window_frames // 2      # e.g. 5 frames -> 2 on each side
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -217,16 +341,42 @@ def main():
     fit_stats = {"gain": [], "at_bound": 0, "not_fitted": 0}
     flow_check = {"error_px": [], "mocap_px": []}    # events: report only
 
+    cache = {}                                       # loaded frames, reused by neighbouring windows
+    fit_stats["background_px"] = []                  # events: fitted background motion over the window
+    logger.info(f"Window: {args.window_frames} frame(s) per label | labelling every "
+                f"{args.frame_step} frame(s)")
+
     for i in range(len(ds) - 1):
         if refs[i].sequence_id != refs[i + 1].sequence_id:
             continue
         if args.limit_frames and n_written >= args.limit_frames:
             break
-        a, b = ds[i], ds[i + 1]
+        if int(refs[i].local_frame_index) % args.frame_step != 0:
+            continue
+
+        # forget frames that no later window can use
+        drop_old_samples(cache, keep_from=i - half)
+
+        a = get_sample(ds, i, cache)
+        b = get_sample(ds, i + 1, cache)
         K = np.asarray(a.camera_intrinsics, np.float64)
         dist = np.asarray(a.camera_distortion, np.float64)
         xy = np.asarray(a.events_xy)
         t = np.asarray(a.events_t, np.float64)
+
+        # events / none: events of the (possibly multi-frame) window around frame i
+        t0, t1, t_ref = a.timestamp, b.timestamp, None
+        first, end = a, b
+        if geometry in ("events", "none"):
+            window = gather_window(ds, refs, i, half, cache)
+            if window is None:
+                n_skipped += 1               # too close to the start/end of the sequence
+                continue
+            xy, t = window["xy"], window["t"]
+            t0, t1 = window["t_start"], window["t_end"]
+            first, end = window["first"], window["end"]
+            if half > 0:
+                t_ref = a.timestamp          # warp to the labelled frame's time
 
         gt = None
         if a.mask is not None:        # quality report only
@@ -259,7 +409,7 @@ def main():
         elif geometry == "events":
             H, W = args.height, args.width
             key = (a.sensor, a.sequence_name)
-            theta, info = fit_background_flow(xy, t, a.timestamp, b.timestamp, H, W,
+            theta, info = fit_background_flow(xy, t, t0, t1, H, W,
                                               model=args.flow_model, init=prev_theta.get(key),
                                               max_events=args.flow_max_events, seed=i)
             if info["fitted"]:
@@ -269,13 +419,16 @@ def main():
             else:
                 fit_stats["not_fitted"] += 1
             flow = flow_field(theta, H, W, args.flow_model)
+            fit_stats["background_px"].append(float(np.median(np.linalg.norm(flow, axis=2))))
             # report only: compare with the motion-capture background flow on static pixels
-            if (a.depth is not None and a.camera_motion.pose_available and b.camera_motion.pose_available
-                    and np.asarray(a.depth).shape[-2:] == (H, W)):
-                depth = _depth_in_metres(a.depth)
+            # (over the same time span: first frame of the window -> frame after the last)
+            if (first.depth is not None and first.camera_motion.pose_available
+                    and end.camera_motion.pose_available
+                    and np.asarray(first.depth).shape[-2:] == (H, W)):
+                depth = _depth_in_metres(first.depth)
                 while depth.ndim > 2:
                     depth = depth[0]
-                R_mc, t_mc = relative_pose(a.camera_motion, b.camera_motion)
+                R_mc, t_mc = relative_pose(first.camera_motion, end.camera_motion)
                 flow_mc = ego_flow(H, W, K, dist, R_mc, t_mc, depth=depth, mode="full")
                 valid = np.isfinite(depth) & (depth > 0.05) & (depth < 20.0)
                 if gt is not None:
@@ -291,7 +444,7 @@ def main():
             label = np.zeros((H, W), bool)
             score = np.zeros((H, W))
         else:
-            score = score_from_flow(xy, t, a.timestamp, b.timestamp, flow)
+            score = score_from_flow(xy, t, t0, t1, flow, t_ref=t_ref)
             label = score_to_label(score, args.threshold, args.min_area)
 
         labels_by_seq.setdefault((a.sensor, a.sequence_name), {})[int(a.local_frame_index)] = label
@@ -309,7 +462,8 @@ def main():
     for (sensor, seq), labels in labels_by_seq.items():
         save_sequence_labels(out, sensor, seq, labels)
 
-    skip_reason = {"imu_rotation": "no gyroscope samples", "mocap": "no depth/pose"}.get(geometry, "none expected")
+    skip_reason = {"imu_rotation": "no gyroscope samples", "mocap": "no depth/pose"}.get(
+        geometry, "window reaches past the start/end of a sequence")
     logger.info(f"Pseudo-labels written: {n_written} frames | skipped ({skip_reason}): {n_skipped}")
     if mocap_check.get("error_deg"):
         logger.info(f"Gyroscope vs motion-capture rotation (report only): median error "
@@ -321,6 +475,9 @@ def main():
                         f"{np.median(fit_stats['gain']):.3f} vs no compensation (median over "
                         f"{len(fit_stats['gain'])} windows) | windows with a parameter at its limit: "
                         f"{fit_stats['at_bound']} | windows too sparse to fit: {fit_stats['not_fitted']}")
+        if fit_stats["background_px"]:
+            logger.info(f"Fitted background motion over the window (no ground truth): median "
+                        f"{np.median(fit_stats['background_px']):.2f} px")
         if flow_check["error_px"]:
             logger.info(f"Event-fitted vs motion-capture background flow (report only, static pixels): "
                         f"median error {np.median(flow_check['error_px']):.2f} px per window, while the "
@@ -332,12 +489,15 @@ def main():
         "settings": {"threshold": args.threshold, "min_area": args.min_area,
                      "geometry": GEOMETRY_DESCRIPTION[geometry],
                      "flow_model": args.flow_model if geometry == "events" else None,
-                     "limit_frames": args.limit_frames},
+                     "limit_frames": args.limit_frames,
+                     "window_frames": args.window_frames, "frame_step": args.frame_step},
         "imu_calibration": calib_report,
         "event_flow": ({
             "median_sharpness_gain": float(np.median(fit_stats["gain"])) if fit_stats["gain"] else None,
             "windows_with_parameter_at_limit": fit_stats["at_bound"],
             "windows_too_sparse": fit_stats["not_fitted"],
+            "median_background_motion_px": (float(np.median(fit_stats["background_px"]))
+                                            if fit_stats["background_px"] else None),
         } if geometry == "events" else None),
         "event_flow_vs_mocap_report_only": ({
             "frames": len(flow_check["error_px"]),
