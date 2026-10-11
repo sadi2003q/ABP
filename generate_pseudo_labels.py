@@ -46,6 +46,13 @@ its own, and the events of the other frames are carried to the
 labelled frame's time through those per-frame flows, one frame at a
 time. Each frame's flow is fitted once and reused by later windows.
 
+--dither (--geometry events): event positions are whole pixels. With
+bilinear splatting, "no motion" is then a false sharpness peak whenever
+the true background motion is below about one pixel, so the fit returns
+zero (small test, 11 Oct: fitted median 0.00 px while motion capture
+shows ~0.5 px). --dither adds random sub-pixel offsets to the events used
+for FITTING only (labels are still scored on the original positions).
+
 --min-background-px P (--geometry events): leave a frame UNLABELLED when
 the fitted background moves less than P pixels over its window. With so
 little camera motion, motion compensation cannot separate moving objects
@@ -242,6 +249,25 @@ def score_to_label(score, threshold, min_area_fraction, close_radius=5):
     return fill_blobs(score > threshold, close_radius=close_radius, min_area_fraction=min_area_fraction)
 
 
+def dither_positions(xy, seed):
+    """
+    Add a random offset of up to half a pixel to every event position.
+
+    Events sit exactly on whole pixels. When the background moves less than
+    about one pixel, the sharpness measure then prefers "no motion at all",
+    because any small shift spreads each event over neighbouring pixels.
+    Random sub-pixel offsets remove that bias, so a small motion can be found.
+    """
+    # Step 1: a random generator, seeded so every run gives the same result
+    rng = np.random.default_rng(seed)
+
+    # Step 2: one random offset per event in x and y, each between -0.5 and +0.5 pixel
+    offsets = rng.uniform(-0.5, 0.5, size=(len(xy), 2))
+
+    # Step 3: shifted positions (the original array is not changed)
+    return np.asarray(xy, np.float64).reshape(-1, 2) + offsets
+
+
 def flow_at_events(flow, x, y):
     """Background displacement (pixels over one frame) at each event position."""
     # Step 1: image size
@@ -402,6 +428,9 @@ def main():
     p.add_argument("--min-background-px", type=float, default=0.0,
                    help="--geometry events: leave a frame unlabelled when the fitted background moves "
                         "less than this many pixels over its window (0 = label every frame).")
+    p.add_argument("--dither", action="store_true",
+                   help="--geometry events: add random sub-pixel offsets to event positions before "
+                        "fitting the background flow (removes the bias towards 'no motion').")
     p.add_argument("--chain", action="store_true",
                    help="With --window-frames > 1 and --geometry events: fit the background flow of "
                         "each frame separately and chain them, instead of one flow for the whole window.")
@@ -425,6 +454,8 @@ def main():
         p.error("--window-frames > 1 is only supported with --geometry events or none")
     if args.min_background_px > 0 and geometry != "events":
         p.error("--min-background-px is only supported with --geometry events")
+    if args.dither and geometry != "events":
+        p.error("--dither is only supported with --geometry events")
     if args.chain and geometry != "events":
         p.error("--chain is only supported with --geometry events")
     if args.frame_step < 1:
@@ -463,7 +494,8 @@ def main():
     flow_cache = {}                                  # --chain: fitted flow of each frame, by dataset index
     fit_stats["background_px"] = []                  # events: fitted background motion over the window
     logger.info(f"Window: {args.window_frames} frame(s) per label"
-                f"{' (per-frame flows, chained)' if args.chain else ''} | labelling every "
+                f"{' (per-frame flows, chained)' if args.chain else ''}"
+                f"{' | sub-pixel dither on' if args.dither else ''} | labelling every "
                 f"{args.frame_step} frame(s)")
 
     for i in range(len(ds) - 1):
@@ -537,8 +569,11 @@ def main():
             for k in range(len(window["xy_parts"])):
                 j = window["first_index"] + k            # dataset index of frame k
                 if j not in flow_cache:
+                    fit_xy = window["xy_parts"][k]
+                    if args.dither:
+                        fit_xy = dither_positions(fit_xy, seed=j)
                     theta, info = fit_background_flow(
-                        window["xy_parts"][k], window["t_parts"][k],
+                        fit_xy, window["t_parts"][k],
                         window["frame_times"][k], window["frame_times"][k + 1], H, W,
                         model=args.flow_model, init=prev_theta.get(key),
                         max_events=args.flow_max_events, seed=j)
@@ -581,7 +616,8 @@ def main():
         elif geometry == "events":
             H, W = args.height, args.width
             key = (a.sensor, a.sequence_name)
-            theta, info = fit_background_flow(xy, t, t0, t1, H, W,
+            fit_xy = dither_positions(xy, seed=i) if args.dither else xy
+            theta, info = fit_background_flow(fit_xy, t, t0, t1, H, W,
                                               model=args.flow_model, init=prev_theta.get(key),
                                               max_events=args.flow_max_events, seed=i)
             if info["fitted"]:
@@ -679,7 +715,8 @@ def main():
                      "flow_model": args.flow_model if geometry == "events" else None,
                      "limit_frames": args.limit_frames,
                      "window_frames": args.window_frames, "frame_step": args.frame_step,
-                     "chain": args.chain, "min_background_px": args.min_background_px},
+                     "chain": args.chain, "min_background_px": args.min_background_px,
+                     "dither": args.dither},
         "imu_calibration": calib_report,
         "event_flow": ({
             "median_sharpness_gain": float(np.median(fit_stats["gain"])) if fit_stats["gain"] else None,
