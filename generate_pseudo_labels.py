@@ -53,6 +53,15 @@ zero (small test, 11 Oct: fitted median 0.00 px while motion capture
 shows ~0.5 px). --dither adds random sub-pixel offsets to the events used
 for FITTING only (labels are still scored on the original positions).
 
+--two-motion (--geometry events, not with --chain): a large moving object
+can produce most of a window's events, and then the one-motion fit locks
+onto the OBJECT instead of the background. With --two-motion a second
+motion is fitted to the events the first one explains worst, events are
+re-assigned to the motion that makes them sharper, and the BACKGROUND is
+chosen as the motion closest to the previous frame's background (or, with
+no previous background, the motion whose events cover more of the image).
+See src/data/two_motion.py.
+
 --min-background-px P (--geometry events): leave a frame UNLABELLED when
 the fitted background moves less than P pixels over its window. With so
 little camera motion, motion compensation cannot separate moving objects
@@ -93,6 +102,7 @@ from src.data.imu_rotation import (
     integrate_gyro, rotation_from_imu, rotation_angle_deg, FrameForCalibration, calibrate_axes,
 )
 from src.data.event_flow import MODELS as FLOW_MODELS, fit_background_flow, flow_field
+from src.data.two_motion import split_two_motions, coverage, choose_background
 
 logger = logging.getLogger("generate_pseudo_labels")
 
@@ -431,6 +441,9 @@ def main():
     p.add_argument("--dither", action="store_true",
                    help="--geometry events: add random sub-pixel offsets to event positions before "
                         "fitting the background flow (removes the bias towards 'no motion').")
+    p.add_argument("--two-motion", action="store_true",
+                   help="--geometry events: fit two motions per window and choose the background "
+                        "by consistency with the previous frame (see src/data/two_motion.py).")
     p.add_argument("--chain", action="store_true",
                    help="With --window-frames > 1 and --geometry events: fit the background flow of "
                         "each frame separately and chain them, instead of one flow for the whole window.")
@@ -456,6 +469,8 @@ def main():
         p.error("--min-background-px is only supported with --geometry events")
     if args.dither and geometry != "events":
         p.error("--dither is only supported with --geometry events")
+    if args.two_motion and (geometry != "events" or args.chain):
+        p.error("--two-motion needs --geometry events and does not work with --chain")
     if args.chain and geometry != "events":
         p.error("--chain is only supported with --geometry events")
     if args.frame_step < 1:
@@ -492,6 +507,9 @@ def main():
 
     cache = {}                                       # loaded frames, reused by neighbouring windows
     flow_cache = {}                                  # --chain: fitted flow of each frame, by dataset index
+    previous_background = {}                         # --two-motion: last background flow per sequence
+    two_motion_stats = {"windows": 0, "two_found": 0, "background_is_second": 0,
+                        "temporal": 0, "coverage": 0}
     fit_stats["background_px"] = []                  # events: fitted background motion over the window
     logger.info(f"Window: {args.window_frames} frame(s) per label"
                 f"{' (per-frame flows, chained)' if args.chain else ''}"
@@ -626,7 +644,40 @@ def main():
                 fit_stats["at_bound"] += int(info["at_bound"])
             else:
                 fit_stats["not_fitted"] += 1
+
+            # --two-motion: is the dominant motion really the background?
+            if args.two_motion and info["fitted"]:
+                two_motion_stats["windows"] += 1
+
+                # Step 1: try to find a second motion in this window
+                result = split_two_motions(fit_xy, t, t0, t1, H, W, args.flow_model, theta,
+                                           max_events=args.flow_max_events, seed=i)
+                if result is not None:
+                    theta_a, theta_b, in_a = result
+                    two_motion_stats["two_found"] += 1
+
+                    # Step 2: how much of the image each motion's events cover
+                    cover_a = coverage(fit_xy, in_a, H, W)
+                    cover_b = coverage(fit_xy, ~in_a, H, W)
+
+                    # Step 3: pick the background (previous frame first, coverage otherwise)
+                    choice, reason = choose_background(
+                        flow_field(theta_a, H, W, args.flow_model),
+                        flow_field(theta_b, H, W, args.flow_model),
+                        previous_background.get(key), cover_a, cover_b)
+                    two_motion_stats[reason] += 1
+
+                    # Step 4: keep the chosen motion as the background
+                    if choice == 0:
+                        theta = theta_a
+                    else:
+                        theta = theta_b
+                        two_motion_stats["background_is_second"] += 1
+                    prev_theta[key] = theta
+
             flow = flow_field(theta, H, W, args.flow_model)
+            if args.two_motion:
+                previous_background[key] = flow          # remembered for the next frame
             fit_stats["background_px"].append(float(np.median(np.linalg.norm(flow, axis=2))))
             # report only: compare with the motion-capture background flow on static pixels
             # (over the same time span: first frame of the window -> frame after the last)
@@ -686,6 +737,11 @@ def main():
     skip_reason = {"imu_rotation": "no gyroscope samples", "mocap": "no depth/pose"}.get(
         geometry, "window reaches past the start/end of a sequence")
     logger.info(f"Pseudo-labels written: {n_written} frames | skipped ({skip_reason}): {n_skipped}")
+    if args.two_motion:
+        s2 = two_motion_stats
+        logger.info(f"Two-motion fit: second motion found in {s2['two_found']}/{s2['windows']} windows | "
+                    f"background = second motion in {s2['background_is_second']} | chosen by previous "
+                    f"frame: {s2['temporal']}, by image coverage: {s2['coverage']}")
     if args.min_background_px > 0:
         logger.info(f"Left unlabelled (background moved < {args.min_background_px} px): "
                     f"{n_too_little_motion} frames")
@@ -716,7 +772,7 @@ def main():
                      "limit_frames": args.limit_frames,
                      "window_frames": args.window_frames, "frame_step": args.frame_step,
                      "chain": args.chain, "min_background_px": args.min_background_px,
-                     "dither": args.dither},
+                     "dither": args.dither, "two_motion": args.two_motion},
         "imu_calibration": calib_report,
         "event_flow": ({
             "median_sharpness_gain": float(np.median(fit_stats["gain"])) if fit_stats["gain"] else None,
@@ -737,6 +793,7 @@ def main():
         } if mocap_check.get("error_deg") else None),
         "frames_labelled": n_written,
         "frames_unlabelled_too_little_motion": n_too_little_motion,
+        "two_motion": two_motion_stats if args.two_motion else None,
         "quality_vs_true_masks": {
             "iou": chosen.iou(),
             "static_frames": chosen.static_frames,
