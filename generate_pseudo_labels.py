@@ -28,6 +28,27 @@ Where the camera motion in step 1 comes from (--geometry):
                   no other sensor; depth/pose loaded only for the report)
     none          no compensation (baseline)
 
+Longer time windows (--window-frames, --chain, --frame-step)
+-----------------------------------------------------------
+By default each label uses the events of ONE frame window (~17 ms at
+60 Hz). In many EVIMO2 recordings the camera moves less than 1 pixel in
+that time, so motion compensation has nothing to undo and moving
+objects move too little to stand out. --window-frames K (odd) uses the
+events of K frames centred on the labelled frame, carried to the time
+of that frame (the time of its true mask). K = 1 is exactly the old
+behaviour. Contrast-maximisation segmentation on EVIMO2 is commonly run
+on ~50 ms slices (Aoki et al., 2025, arXiv 2504.18447), i.e. K = 3.
+
+--chain (with --window-frames > 1, --geometry events): one flow formula
+for a long window fits badly (K = 9: 1.85 px error vs 0.5 px for one
+frame). With --chain the background flow is fitted for EACH frame on
+its own, and the events of the other frames are carried to the
+labelled frame's time through those per-frame flows, one frame at a
+time. Each frame's flow is fitted once and reused by later windows.
+
+--frame-step N labels only every N-th frame (quick checks). Do not use
+it before refine_pseudo_labels.py: refinement needs neighbouring labels.
+
 Usage
 -----
 python generate_pseudo_labels.py \
@@ -180,9 +201,19 @@ def gather_window(ds, refs, i, half, cache):
     first_sample = get_sample(ds, first_index, cache)
     end_sample = get_sample(ds, after_last_index, cache)
 
+    # Step 8: start time of every frame, plus the end of the last one
+    #         e.g. 5 frames -> 6 times
+    frame_times = []
+    for j in range(first_index, after_last_index + 1):
+        frame_times.append(get_sample(ds, j, cache).timestamp)
+
     return {
         "xy": xy,
         "t": t,
+        "xy_parts": xy_parts,
+        "t_parts": t_parts,
+        "frame_times": frame_times,
+        "first_index": first_index,
         "t_start": first_sample.timestamp,
         "t_end": end_sample.timestamp,
         "first": first_sample,
@@ -201,6 +232,74 @@ def pseudo_score(xy, t, t0, t1, K, dist, R, trans, depth, H=None, W=None, mode="
 
 def score_to_label(score, threshold, min_area_fraction, close_radius=5):
     return fill_blobs(score > threshold, close_radius=close_radius, min_area_fraction=min_area_fraction)
+
+
+def flow_at_events(flow, x, y):
+    """Background displacement (pixels over one frame) at each event position."""
+    # Step 1: image size
+    H, W = flow.shape[:2]
+
+    # Step 2: nearest pixel of each event, kept inside the image
+    x_pixel = np.clip(np.round(x).astype(int), 0, W - 1)
+    y_pixel = np.clip(np.round(y).astype(int), 0, H - 1)
+
+    # Step 3: read the flow there, shape (number of events, 2)
+    return flow[y_pixel, x_pixel]
+
+
+def warp_chained(xy_parts, t_parts, frame_flows, frame_times, ref_position):
+    """
+    Carry the events of every frame in the window to the start time of the
+    labelled frame, using each frame's OWN background flow.
+
+    xy_parts[k], t_parts[k] : events of frame k of the window
+    frame_flows[k]          : background displacement over frame k (H, W, 2)
+    frame_times[k]          : start time of frame k (one extra entry = end of the last frame)
+    ref_position            : position of the labelled frame in the window, e.g. 2 of 0..4
+
+    With one frame (ref_position = 0) this is exactly compensate().
+    """
+    x_parts = []
+    y_parts = []
+    for k in range(len(xy_parts)):
+        # Step 1: event positions of frame k
+        x = xy_parts[k][:, 0].astype(np.float64)
+        y = xy_parts[k][:, 1].astype(np.float64)
+
+        # Step 2: how far through frame k each event happened (0 = start, 1 = end)
+        frame_length = max(frame_times[k + 1] - frame_times[k], 1e-9)
+        fraction = np.clip((t_parts[k] - frame_times[k]) / frame_length, 0.0, 1.0)
+
+        if k >= ref_position:
+            # Step 3a: frame k is the labelled frame or later:
+            #          move each event back to the START of frame k
+            displacement = flow_at_events(frame_flows[k], x, y)
+            x = x - fraction * displacement[:, 0]
+            y = y - fraction * displacement[:, 1]
+
+            # Step 4a: then back one whole frame at a time, down to the labelled frame
+            for m in range(k - 1, ref_position - 1, -1):
+                displacement = flow_at_events(frame_flows[m], x, y)
+                x = x - displacement[:, 0]
+                y = y - displacement[:, 1]
+        else:
+            # Step 3b: frame k is before the labelled frame:
+            #          move each event forward to the END of frame k
+            displacement = flow_at_events(frame_flows[k], x, y)
+            x = x + (1.0 - fraction) * displacement[:, 0]
+            y = y + (1.0 - fraction) * displacement[:, 1]
+
+            # Step 4b: then forward one whole frame at a time, up to the labelled frame
+            for m in range(k + 1, ref_position):
+                displacement = flow_at_events(frame_flows[m], x, y)
+                x = x + displacement[:, 0]
+                y = y + displacement[:, 1]
+
+        x_parts.append(x)
+        y_parts.append(y)
+
+    # Step 5: join all frames back into one list
+    return np.concatenate(x_parts), np.concatenate(y_parts)
 
 
 class Pooled:
@@ -292,6 +391,9 @@ def main():
     p.add_argument("--window-frames", type=int, default=1,
                    help="Odd number of frames whose events are used for each label, centred on the "
                         "labelled frame (--geometry events / none only). 1 = old behaviour.")
+    p.add_argument("--chain", action="store_true",
+                   help="With --window-frames > 1 and --geometry events: fit the background flow of "
+                        "each frame separately and chain them, instead of one flow for the whole window.")
     p.add_argument("--frame-step", type=int, default=1,
                    help="Label only every N-th frame (quick checks only; refinement needs every frame).")
     p.add_argument("--limit-frames", type=int, default=0,
@@ -310,6 +412,8 @@ def main():
         p.error("--window-frames must be an odd number (1, 3, 5, ...)")
     if args.window_frames > 1 and geometry not in ("events", "none"):
         p.error("--window-frames > 1 is only supported with --geometry events or none")
+    if args.chain and geometry != "events":
+        p.error("--chain is only supported with --geometry events")
     if args.frame_step < 1:
         p.error("--frame-step must be 1 or more")
     half = args.window_frames // 2      # e.g. 5 frames -> 2 on each side
@@ -342,8 +446,10 @@ def main():
     flow_check = {"error_px": [], "mocap_px": []}    # events: report only
 
     cache = {}                                       # loaded frames, reused by neighbouring windows
+    flow_cache = {}                                  # --chain: fitted flow of each frame, by dataset index
     fit_stats["background_px"] = []                  # events: fitted background motion over the window
-    logger.info(f"Window: {args.window_frames} frame(s) per label | labelling every "
+    logger.info(f"Window: {args.window_frames} frame(s) per label"
+                f"{' (per-frame flows, chained)' if args.chain else ''} | labelling every "
                 f"{args.frame_step} frame(s)")
 
     for i in range(len(ds) - 1):
@@ -356,6 +462,8 @@ def main():
 
         # forget frames that no later window can use
         drop_old_samples(cache, keep_from=i - half)
+        drop_old_samples(flow_cache, keep_from=i - half)
+        chained_score = None
 
         a = get_sample(ds, i, cache)
         b = get_sample(ds, i + 1, cache)
@@ -406,6 +514,56 @@ def main():
             R, trans = relative_pose(a.camera_motion, b.camera_motion)
             H, W = depth.shape
             flow = ego_flow(H, W, K, dist, R, trans, depth=depth, mode="full")
+        elif geometry == "events" and args.chain:
+            H, W = args.height, args.width
+            key = (a.sensor, a.sequence_name)
+
+            # Step 1: fitted flow of every frame in the window (each frame fitted only once)
+            frame_flows = []
+            for k in range(len(window["xy_parts"])):
+                j = window["first_index"] + k            # dataset index of frame k
+                if j not in flow_cache:
+                    theta, info = fit_background_flow(
+                        window["xy_parts"][k], window["t_parts"][k],
+                        window["frame_times"][k], window["frame_times"][k + 1], H, W,
+                        model=args.flow_model, init=prev_theta.get(key),
+                        max_events=args.flow_max_events, seed=j)
+                    if info["fitted"]:
+                        prev_theta[key] = theta
+                        fit_stats["gain"].append(info["gain"])
+                        fit_stats["at_bound"] += int(info["at_bound"])
+                    else:
+                        fit_stats["not_fitted"] += 1
+                    flow_cache[j] = flow_field(theta, H, W, args.flow_model)
+                frame_flows.append(flow_cache[j])
+
+            # Step 2: background motion over the whole window (report, no ground truth)
+            total_flow = np.sum(np.stack(frame_flows), axis=0)
+            fit_stats["background_px"].append(float(np.median(np.linalg.norm(total_flow, axis=2))))
+
+            # Step 3: the labelled frame's own flow, for the motion-capture comparison below
+            flow = frame_flows[half]
+            if (a.depth is not None and a.camera_motion.pose_available and b.camera_motion.pose_available
+                    and np.asarray(a.depth).shape[-2:] == (H, W)):
+                depth = _depth_in_metres(a.depth)
+                while depth.ndim > 2:
+                    depth = depth[0]
+                R_mc, t_mc = relative_pose(a.camera_motion, b.camera_motion)
+                flow_mc = ego_flow(H, W, K, dist, R_mc, t_mc, depth=depth, mode="full")
+                valid = np.isfinite(depth) & (depth > 0.05) & (depth < 20.0)
+                if gt is not None:
+                    valid &= ~gt
+                if valid.sum() > 100:
+                    flow_check["error_px"].append(float(np.median(np.linalg.norm(flow - flow_mc, axis=2)[valid])))
+                    flow_check["mocap_px"].append(float(np.median(np.linalg.norm(flow_mc, axis=2)[valid])))
+
+            # Step 4: carry all events to the labelled frame's time and score them
+            if len(t) > 0:
+                x_warped, y_warped = warp_chained(window["xy_parts"], window["t_parts"],
+                                                  frame_flows, window["frame_times"], half)
+                # signed fraction of the whole window between each event and the labelled frame
+                alpha = (t - a.timestamp) / max(t1 - t0, 1e-9)
+                chained_score = scores_from_warped(x_warped, y_warped, alpha, H, W)["contrast"]
         elif geometry == "events":
             H, W = args.height, args.width
             key = (a.sensor, a.sequence_name)
@@ -444,7 +602,10 @@ def main():
             label = np.zeros((H, W), bool)
             score = np.zeros((H, W))
         else:
-            score = score_from_flow(xy, t, t0, t1, flow, t_ref=t_ref)
+            if chained_score is not None:
+                score = chained_score
+            else:
+                score = score_from_flow(xy, t, t0, t1, flow, t_ref=t_ref)
             label = score_to_label(score, args.threshold, args.min_area)
 
         labels_by_seq.setdefault((a.sensor, a.sequence_name), {})[int(a.local_frame_index)] = label
@@ -490,7 +651,8 @@ def main():
                      "geometry": GEOMETRY_DESCRIPTION[geometry],
                      "flow_model": args.flow_model if geometry == "events" else None,
                      "limit_frames": args.limit_frames,
-                     "window_frames": args.window_frames, "frame_step": args.frame_step},
+                     "window_frames": args.window_frames, "frame_step": args.frame_step,
+                     "chain": args.chain},
         "imu_calibration": calib_report,
         "event_flow": ({
             "median_sharpness_gain": float(np.median(fit_stats["gain"])) if fit_stats["gain"] else None,
