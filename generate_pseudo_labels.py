@@ -46,6 +46,14 @@ its own, and the events of the other frames are carried to the
 labelled frame's time through those per-frame flows, one frame at a
 time. Each frame's flow is fitted once and reused by later windows.
 
+--min-background-px P (--geometry events): leave a frame UNLABELLED when
+the fitted background moves less than P pixels over its window. With so
+little camera motion, motion compensation cannot separate moving objects
+from the background, so any label would be mostly noise. Unlabelled
+frames are skipped by the trainer (never treated as "no moving object").
+The rule uses only the events, never the true masks (similar to how
+Un-EVIMO, ECCV 2024, drops slices whose pseudo-label is unreliable).
+
 --frame-step N labels only every N-th frame (quick checks). Do not use
 it before refine_pseudo_labels.py: refinement needs neighbouring labels.
 
@@ -391,6 +399,9 @@ def main():
     p.add_argument("--window-frames", type=int, default=1,
                    help="Odd number of frames whose events are used for each label, centred on the "
                         "labelled frame (--geometry events / none only). 1 = old behaviour.")
+    p.add_argument("--min-background-px", type=float, default=0.0,
+                   help="--geometry events: leave a frame unlabelled when the fitted background moves "
+                        "less than this many pixels over its window (0 = label every frame).")
     p.add_argument("--chain", action="store_true",
                    help="With --window-frames > 1 and --geometry events: fit the background flow of "
                         "each frame separately and chain them, instead of one flow for the whole window.")
@@ -412,6 +423,8 @@ def main():
         p.error("--window-frames must be an odd number (1, 3, 5, ...)")
     if args.window_frames > 1 and geometry not in ("events", "none"):
         p.error("--window-frames > 1 is only supported with --geometry events or none")
+    if args.min_background_px > 0 and geometry != "events":
+        p.error("--min-background-px is only supported with --geometry events")
     if args.chain and geometry != "events":
         p.error("--chain is only supported with --geometry events")
     if args.frame_step < 1:
@@ -441,6 +454,7 @@ def main():
     chosen = Pooled()
     labels_by_seq: dict[tuple, dict[int, np.ndarray]] = {}
     n_written, n_skipped, t_start = 0, 0, time.time()
+    n_too_little_motion = 0          # --min-background-px: frames left unlabelled
     prev_theta: dict[tuple, np.ndarray] = {}        # events: previous window's flow, as a starting guess
     fit_stats = {"gain": [], "at_bound": 0, "not_fitted": 0}
     flow_check = {"error_px": [], "mocap_px": []}    # events: report only
@@ -598,6 +612,16 @@ def main():
             H, W = args.height, args.width
             flow = np.zeros((H, W, 2), np.float32)
 
+        # --min-background-px: too little camera motion -> leave this frame unlabelled
+        if geometry == "events" and args.min_background_px > 0:
+            # Step 1: how far the fitted background moved over this window, e.g. 0.6 px
+            background_moved = fit_stats["background_px"][-1]
+
+            # Step 2: below the limit -> no label for this frame
+            if background_moved < args.min_background_px:
+                n_too_little_motion += 1
+                continue
+
         if len(t) == 0:
             label = np.zeros((H, W), bool)
             score = np.zeros((H, W))
@@ -626,6 +650,9 @@ def main():
     skip_reason = {"imu_rotation": "no gyroscope samples", "mocap": "no depth/pose"}.get(
         geometry, "window reaches past the start/end of a sequence")
     logger.info(f"Pseudo-labels written: {n_written} frames | skipped ({skip_reason}): {n_skipped}")
+    if args.min_background_px > 0:
+        logger.info(f"Left unlabelled (background moved < {args.min_background_px} px): "
+                    f"{n_too_little_motion} frames")
     if mocap_check.get("error_deg"):
         logger.info(f"Gyroscope vs motion-capture rotation (report only): median error "
                     f"{np.median(mocap_check['error_deg']):.3f} deg per frame, while the camera "
@@ -652,7 +679,7 @@ def main():
                      "flow_model": args.flow_model if geometry == "events" else None,
                      "limit_frames": args.limit_frames,
                      "window_frames": args.window_frames, "frame_step": args.frame_step,
-                     "chain": args.chain},
+                     "chain": args.chain, "min_background_px": args.min_background_px},
         "imu_calibration": calib_report,
         "event_flow": ({
             "median_sharpness_gain": float(np.median(fit_stats["gain"])) if fit_stats["gain"] else None,
@@ -672,6 +699,7 @@ def main():
             "median_mocap_rotation_deg": float(np.median(mocap_check["mocap_deg"])),
         } if mocap_check.get("error_deg") else None),
         "frames_labelled": n_written,
+        "frames_unlabelled_too_little_motion": n_too_little_motion,
         "quality_vs_true_masks": {
             "iou": chosen.iou(),
             "static_frames": chosen.static_frames,
