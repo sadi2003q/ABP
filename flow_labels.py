@@ -49,6 +49,16 @@ How (per labelled frame i)
    TRANSLATION (parallax). Epipolar only if that is larger than
    --parallax-px, planar otherwise (the usual check in visual SLAM before
    trusting an epipolar fit).
+   Single-frame parallax is noisy (scene15_00 switched in 15/40 frames even
+   at 6 px), but the kind of camera motion changes slowly. "smoothed" =
+   decide with the MEDIAN parallax of the frames within +-30 frames (same
+   sequence): epipolar (>= 2 px) if above --parallax-px, planar (noise
+   rule) otherwise. 12 Oct small test: median parallax ~10 px when the
+   camera moves through the room (scene14_00/01), ~3 px when it is almost
+   still (scene15_00/03) -> --parallax-px 6 (chosen on training sequences
+   only; scene13 untouched).
+6. Labels of the two main rules are always saved, so a full run never has
+   to be repeated: <out-dir>/planar_noise and <out-dir>/smoothed.
 
 The true masks are used ONLY to score the labels.
 Needs Internet ON in Kaggle the first time (downloads RAFT weights, ~20 MB).
@@ -359,7 +369,9 @@ def main():
     p.add_argument("--written", default="otsu",
                    help="Which rule's labels are WRITTEN: otsu, noise, or a fixed number such as 2.0. "
                         "Also: epipolar, hybrid, parallax. All rules are reported.")
-    p.add_argument("--parallax-px", type=float, default=1.0,
+    p.add_argument("--parallax-window", type=int, default=30,
+                   help="smoothed rule: frames on each side whose parallax is combined (median).")
+    p.add_argument("--parallax-px", type=float, default=6.0,
                    help="parallax rule: use the epipolar check only when the camera translation moves the "
                         "background by more than this many pixels (after removing rotation).")
     p.add_argument("--min-threshold", type=float, default=1.0,
@@ -395,6 +407,7 @@ def main():
     agree_shares = {}            # sequence -> list of RANSAC agreement shares
     used_thresholds = {}         # sequence -> per-frame thresholds that were used
     parallax_values = {}         # sequence -> per-frame translation parallax (pixels)
+    smoothing_store = []         # per frame: parallax + the two candidate labels (for the smoothed rule)
     epipolar_chosen = {}         # sequence -> frames where the parallax rule chose epipolar
     examples = []
     cache = {}
@@ -527,6 +540,18 @@ def main():
                                 min_area_fraction=args.min_area)
         labels_by_seq.setdefault((a.sensor, sequence), {})[int(a.local_frame_index)] = chosen
 
+        # Step 11b: keep what the smoothed rule needs (decided after the loop)
+        epipolar_label = frame_labels.get("epipolar 2.0 px", frame_labels["per-frame noise"])
+        if "epipolar 2.0 px" in frame_labels:
+            # same as the "parallax 2.0 px" rule: threshold at least 2 px, or the noise level if higher
+            epipolar_label = fill_blobs((epipolar > max(2.0, epipolar_noise)) & has_events,
+                                        close_radius=5, min_area_fraction=args.min_area)
+        smoothing_store.append({
+            "sensor": a.sensor, "sequence": sequence, "frame": int(a.local_frame_index),
+            "parallax": parallax, "planar": frame_labels["per-frame noise"],
+            "epipolar": epipolar_label, "gt": gt,
+        })
+
         # Step 12: frames for the check picture
         if gt is not None and gt.any() and len(examples) < 24:
             examples.append((sequence, int(a.local_frame_index), picture_1, gt,
@@ -536,9 +561,39 @@ def main():
         if n_done % 10 == 0:
             print(f"  {n_done} frames ({(time.time() - t_start) / n_done:.1f} s/frame)", flush=True)
 
-    # Step 13: save the written labels
+    # Step 13: smoothed rule: median parallax of the neighbouring frames decides
+    smoothed_by_seq = {}
+    planar_by_seq = {}
+    smoothed_epipolar = {}
+    for entry in smoothing_store:
+        # Step 13a: parallax of all labelled frames within +-window in the same sequence
+        nearby = [other["parallax"] for other in smoothing_store
+                  if other["sequence"] == entry["sequence"]
+                  and abs(other["frame"] - entry["frame"]) <= args.parallax_window]
+        typical_parallax = float(np.median(nearby))
+
+        # Step 13b: epipolar when the camera clearly moves through the scene, planar otherwise
+        if typical_parallax > args.parallax_px:
+            label = entry["epipolar"]
+            smoothed_epipolar[entry["sequence"]] = smoothed_epipolar.get(entry["sequence"], 0) + 1
+        else:
+            label = entry["planar"]
+        key = (entry["sensor"], entry["sequence"])
+        smoothed_by_seq.setdefault(key, {})[entry["frame"]] = label
+        planar_by_seq.setdefault(key, {})[entry["frame"]] = entry["planar"]
+
+        # Step 13c: score it (true masks: report only)
+        if entry["gt"] is not None:
+            scores.setdefault((entry["sequence"], "smoothed"), Pooled()).update(label, entry["gt"])
+            scores.setdefault(("ALL", "smoothed"), Pooled()).update(label, entry["gt"])
+
+    # Step 13d: save labels: the --written rule, and always the two main rules
     for (sensor, sequence), labels in labels_by_seq.items():
         save_sequence_labels(out, sensor, sequence, labels)
+    for (sensor, sequence), labels in planar_by_seq.items():
+        save_sequence_labels(out / "planar_noise", sensor, sequence, labels)
+    for (sensor, sequence), labels in smoothed_by_seq.items():
+        save_sequence_labels(out / "smoothed", sensor, sequence, labels)
 
     # Step 14: result table
     print("\n" + "=" * 100)
@@ -548,7 +603,8 @@ def main():
     rule_names = [f"fixed {thr:.1f} px" for thr in THRESHOLDS] + ["per-frame otsu", "per-frame noise",
                                                                   "epipolar 1.0 px", "epipolar 2.0 px",
                                                                   "epipolar noise", "hybrid noise",
-                                                                  "parallax noise", "parallax 2.0 px"]
+                                                                  "parallax noise", "parallax 2.0 px",
+                                                                  "smoothed"]
     report = {}
     for sequence in list(args.sequence) + ["ALL"]:
         if sequence == "ALL":
@@ -564,7 +620,8 @@ def main():
             values = parallax_values.get(sequence, [])
             if values:
                 print(f"    translation parallax: median {np.median(values):.2f} px | parallax rule chose "
-                      f"epipolar in {epipolar_chosen.get(sequence, 0)}/{len(values)} frames")
+                      f"epipolar in {epipolar_chosen.get(sequence, 0)}/{len(values)} frames | smoothed rule: "
+                      f"{smoothed_epipolar.get(sequence, 0)}/{len(values)} frames")
         for name in rule_names:
             pooled = scores.get((sequence, name))
             if pooled is None:
@@ -598,6 +655,7 @@ def main():
         plt.savefig(out / "flow_check.png", dpi=70)
         print(f"\nPicture saved: {out / 'flow_check.png'}")
     print(f"Labels saved (rule: {args.written}): {out}")
+    print(f"Also saved: {out / 'planar_noise'} and {out / 'smoothed'}")
 
 
 if __name__ == "__main__":
