@@ -20,9 +20,19 @@ How (per labelled frame i)
    events it has, so a large textured moving object cannot outvote the
    background by producing more events (the failure of B1).
 4. Moving pixels: event pixels whose flow differs from the background
-   motion by more than a threshold; several thresholds are scored side by
-   side. Then close gaps, fill holes and drop small blobs. A frame with no
-   blob left gets an EMPTY label ("no moving object").
+   motion by more than a threshold. Scored side by side:
+     fixed 1.0 / 1.5 / 2.0 / 3.0 px
+     per-frame "otsu":  the threshold that best separates this frame's
+                        differences into two groups (Otsu's method, as in
+                        Un-EVIMO), never below 1 px
+     per-frame "noise": 4 x the spread of the background cells' own
+                        differences (how noisy the flow is in this frame),
+                        never below 1 px
+   Then close gaps, fill holes and drop small blobs. A frame with no blob
+   left gets an EMPTY label ("no moving object").
+   12 Oct small test: the planar background model (8 numbers, exact motion
+   of a slanted flat wall) beat the affine one on scene14_01 (0.37 vs 0.20),
+   so planar is now the default.
 
 The true masks are used ONLY to score the labels.
 Needs Internet ON in Kaggle the first time (downloads RAFT weights, ~20 MB).
@@ -207,6 +217,35 @@ def ransac_background(xs, ys, us, vs, H, W, model="affine", iterations=300,
     return theta, float(best_inliers.mean())
 
 
+def otsu_threshold(values, top=10.0, bins=256):
+    """
+    Otsu's method: the cut that best separates the values into a low group
+    and a high group (largest difference between the two group averages,
+    weighted by group sizes). Values are clipped to 0..top pixels.
+    """
+    # Step 1: histogram of the values
+    values = np.clip(values, 0.0, top)
+    counts, edges = np.histogram(values, bins=bins, range=(0.0, top))
+    centres = (edges[:-1] + edges[1:]) / 2.0
+
+    # Step 2: for every possible cut: size and average of the low group
+    low_size = np.cumsum(counts).astype(np.float64)
+    low_sum = np.cumsum(counts * centres)
+    total_size = low_size[-1]
+    total_sum = low_sum[-1]
+    if total_size == 0:
+        return top
+
+    # Step 3: size and average of the high group
+    high_size = total_size - low_size
+    low_mean = low_sum / np.maximum(low_size, 1e-9)
+    high_mean = (total_sum - low_sum) / np.maximum(high_size, 1e-9)
+
+    # Step 4: between-group spread; best cut = largest spread
+    spread = low_size * high_size * (low_mean - high_mean) ** 2
+    return float(edges[int(np.argmax(spread)) + 1])
+
+
 def model_flow(theta, H, W, model):
     """Motion model -> flow (H, W, 2) for every pixel."""
     v, u = np.mgrid[0:H, 0:W]
@@ -227,10 +266,13 @@ def main():
     p.add_argument("--sequence", nargs="+", required=True)
     p.add_argument("--frame-step", type=int, default=10, help="Label every N-th frame.")
     p.add_argument("--gap", type=int, default=3, help="Frames of events in each of the two pictures.")
-    p.add_argument("--background-model", choices=["translation", "affine", "planar"], default="affine")
+    p.add_argument("--background-model", choices=["translation", "affine", "planar"], default="planar")
     p.add_argument("--inlier-px", type=float, default=1.0, help="RANSAC: cell agrees within this many pixels.")
-    p.add_argument("--threshold", type=float, default=1.5,
-                   help="Flow difference (pixels) for the WRITTEN labels; all THRESHOLDS are reported.")
+    p.add_argument("--written", default="otsu",
+                   help="Which rule's labels are WRITTEN: otsu, noise, or a fixed number such as 2.0. "
+                        "All rules are reported.")
+    p.add_argument("--min-threshold", type=float, default=1.0,
+                   help="Per-frame thresholds are never below this many pixels.")
     p.add_argument("--min-area", type=float, default=0.01, help="Smallest blob kept (fraction of image).")
     p.add_argument("--raft", choices=["large", "small"], default="large")
     p.add_argument("--height", type=int, default=480)
@@ -260,6 +302,7 @@ def main():
     scores = {}                  # (sequence, threshold) -> Pooled
     labels_by_seq = {}
     agree_shares = {}            # sequence -> list of RANSAC agreement shares
+    used_thresholds = {}         # sequence -> per-frame thresholds that were used
     examples = []
     cache = {}
     n_done = 0
@@ -307,23 +350,41 @@ def main():
         background = model_flow(theta, H, W, args.background_model)
         difference = np.linalg.norm(flow - background, axis=2)
 
-        # Step 9: one label per threshold
-        frame_labels = {}
-        for threshold in THRESHOLDS:
-            moving = (difference > threshold) & has_events
-            frame_labels[threshold] = fill_blobs(moving, close_radius=5, min_area_fraction=args.min_area)
-        if gt is not None:
-            for threshold, label in frame_labels.items():
-                scores.setdefault((sequence, threshold), Pooled()).update(label, gt)
+        # Step 9: the per-frame thresholds
+        #   otsu : best split of this frame's differences (event pixels only)
+        otsu = max(args.min_threshold, otsu_threshold(difference[has_events]))
+        #   noise: 4 x robust spread of the background cells' own differences
+        residuals = cell_residuals(theta, xs, ys, us, vs, H, W, args.background_model)
+        background_cells = residuals[residuals < args.inlier_px]
+        spread = 1.4826 * float(np.median(background_cells)) if len(background_cells) else 1.0
+        noise = max(args.min_threshold, 4.0 * spread)
+        used_thresholds.setdefault(sequence, {"otsu": [], "noise": []})
+        used_thresholds[sequence]["otsu"].append(otsu)
+        used_thresholds[sequence]["noise"].append(noise)
 
-        # Step 10: keep the label of the chosen threshold
-        chosen = frame_labels.get(args.threshold)
-        if chosen is None:
-            moving = (difference > args.threshold) & has_events
-            chosen = fill_blobs(moving, close_radius=5, min_area_fraction=args.min_area)
+        # Step 10: one label per rule
+        rules = {f"fixed {thr:.1f} px": thr for thr in THRESHOLDS}
+        rules["per-frame otsu"] = otsu
+        rules["per-frame noise"] = noise
+        frame_labels = {}
+        for name, threshold in rules.items():
+            moving = (difference > threshold) & has_events
+            frame_labels[name] = fill_blobs(moving, close_radius=5, min_area_fraction=args.min_area)
+        if gt is not None:
+            for name, label in frame_labels.items():
+                scores.setdefault((sequence, name), Pooled()).update(label, gt)
+                scores.setdefault(("ALL", name), Pooled()).update(label, gt)
+
+        # Step 11: keep the label of the --written rule
+        if args.written in ("otsu", "noise"):
+            chosen = frame_labels[f"per-frame {args.written}"]
+        else:
+            threshold = float(args.written)
+            chosen = fill_blobs((difference > threshold) & has_events, close_radius=5,
+                                min_area_fraction=args.min_area)
         labels_by_seq.setdefault((a.sensor, sequence), {})[int(a.local_frame_index)] = chosen
 
-        # Step 11: frames for the check picture
+        # Step 12: frames for the check picture
         if gt is not None and gt.any() and len(examples) < 24:
             examples.append((sequence, int(a.local_frame_index), picture_1, gt,
                              np.linalg.norm(flow, axis=2), np.clip(difference, 0, 5), chosen))
@@ -332,34 +393,41 @@ def main():
         if n_done % 10 == 0:
             print(f"  {n_done} frames ({(time.time() - t_start) / n_done:.1f} s/frame)", flush=True)
 
-    # Step 12: save the written labels
+    # Step 13: save the written labels
     for (sensor, sequence), labels in labels_by_seq.items():
         save_sequence_labels(out, sensor, sequence, labels)
 
-    # Step 13: result table
-    print("\n" + "=" * 96)
-    print("SMALL TEST: dense-flow labels against the TRUE masks (report only)")
+    # Step 14: result table
+    print("\n" + "=" * 100)
+    print(f"SMALL TEST: dense-flow labels against the TRUE masks (report only) | background model: {args.background_model}")
     print("Reference, B1 (one motion + dither) on the same sequences: 14_01 0.278 | 15_00 0.003 | 6_03 0.016")
-    print("=" * 96)
+    print("=" * 100)
+    rule_names = [f"fixed {thr:.1f} px" for thr in THRESHOLDS] + ["per-frame otsu", "per-frame noise"]
     report = {}
-    for sequence in args.sequence:
-        shares = agree_shares.get(sequence, [])
-        median_share = float(np.median(shares)) if shares else float("nan")
-        print(f"--- {sequence}   (cells agreeing with the background: median {median_share:.2f}) ---")
-        for threshold in THRESHOLDS:
-            pooled = scores.get((sequence, threshold))
+    for sequence in list(args.sequence) + ["ALL"]:
+        if sequence == "ALL":
+            print("--- ALL sequences pooled ---")
+        else:
+            shares = agree_shares.get(sequence, [])
+            median_share = float(np.median(shares)) if shares else float("nan")
+            used = used_thresholds.get(sequence, {"otsu": [], "noise": []})
+            otsu_median = float(np.median(used["otsu"])) if used["otsu"] else float("nan")
+            noise_median = float(np.median(used["noise"])) if used["noise"] else float("nan")
+            print(f"--- {sequence}   (cells agreeing with background: {median_share:.2f} | "
+                  f"median per-frame threshold: otsu {otsu_median:.2f} px, noise {noise_median:.2f} px) ---")
+        for name in rule_names:
+            pooled = scores.get((sequence, name))
             if pooled is None:
                 continue
             precision = pooled.tp / max(1, pooled.tp + pooled.fp)
             recall = pooled.tp / max(1, pooled.tp + pooled.fn)
-            print(f"  flow difference > {threshold:.1f} px   IoU {pooled.iou():.3f}   precision {precision:.3f}   "
+            print(f"  {name:<17} IoU {pooled.iou():.3f}   precision {precision:.3f}   "
                   f"recall {recall:.3f}   false-blob frames {pooled.static_frames_with_fp}/{pooled.static_frames}")
-            report[f"{sequence} | thr={threshold}"] = {"iou": pooled.iou(), "precision": precision,
-                                                        "recall": recall}
+            report[f"{sequence} | {name}"] = {"iou": pooled.iou(), "precision": precision, "recall": recall}
     with open(out / "flow_report.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    # Step 14: check picture
+    # Step 15: check picture
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -369,7 +437,7 @@ def main():
         picked += own[:: max(1, len(own) // 2)][:2]
     if picked:
         titles = ["events (before)", "true moving mask", "flow size (px)",
-                  "difference from background (0-5 px)", f"label (> {args.threshold} px)"]
+                  "difference from background (0-5 px)", f"label ({args.written})"]
         figure, axes = plt.subplots(len(picked), 5, figsize=(20, 3.2 * len(picked)), squeeze=False)
         for row, (sequence, frame_index, events_img, gt, flow_size, diff, label) in enumerate(picked):
             for column, picture in enumerate([events_img, gt, flow_size, diff, label]):
@@ -379,7 +447,7 @@ def main():
         plt.tight_layout()
         plt.savefig(out / "flow_check.png", dpi=70)
         print(f"\nPicture saved: {out / 'flow_check.png'}")
-    print(f"Labels saved (threshold {args.threshold} px): {out}")
+    print(f"Labels saved (rule: {args.written}): {out}")
 
 
 if __name__ == "__main__":
