@@ -42,8 +42,13 @@ How (per labelled frame i)
    with RANSAC to the cell flows using the camera calibration; a pixel is
    moving if it is far from its epipolar line. No depth is needed.
    "hybrid" = planar when most cells agree with one plane (>= 0.9), epipolar
-   otherwise (with very little camera translation the epipolar fit is
-   unreliable, and one plane is then enough).
+   otherwise. FAILED on scene15_00: a big object lowers the agreement, so it
+   switched to epipolar exactly when the camera barely moves (epipolar fit
+   meaningless). "parallax" = the fix: remove the camera's fitted ROTATION
+   from the agreeing cells' motion; what is left is caused by camera
+   TRANSLATION (parallax). Epipolar only if that is larger than
+   --parallax-px, planar otherwise (the usual check in visual SLAM before
+   trusting an epipolar fit).
 
 The true masks are used ONLY to score the labels.
 Needs Internet ON in Kaggle the first time (downloads RAFT weights, ~20 MB).
@@ -283,6 +288,29 @@ def fit_essential(xs, ys, us, vs, K, dist, inlier_px):
     return E[:3, :3], mask.ravel().astype(bool)
 
 
+def translation_parallax(E, start, end, inliers, focal):
+    """
+    How far (pixels) the agreeing cells moved BEYOND what the camera's
+    rotation alone explains, i.e. motion caused by camera translation.
+    Median over the agreeing cells. Small -> no parallax -> use one plane.
+    """
+    import cv2
+    if inliers is None or inliers.sum() < 8:
+        return 0.0
+
+    # Step 1: camera rotation R (and translation direction) from the essential matrix
+    _, R, t, _ = cv2.recoverPose(E, start[inliers], end[inliers], focal=1.0, pp=(0.0, 0.0))
+
+    # Step 2: where each start point would land if the camera ONLY rotated
+    ones = np.ones((int(inliers.sum()), 1))
+    rays = np.hstack([start[inliers], ones]) @ R.T
+    rotated = rays[:, :2] / rays[:, 2:3]
+
+    # Step 3: what is left over is due to translation; median, in pixels
+    left_over = np.linalg.norm(end[inliers] - rotated, axis=1)
+    return float(np.median(left_over)) * focal
+
+
 def epipolar_distance(E, start, end, focal):
     """
     Distance (pixels) of each moved point from its epipolar line
@@ -330,7 +358,10 @@ def main():
     p.add_argument("--inlier-px", type=float, default=1.0, help="RANSAC: cell agrees within this many pixels.")
     p.add_argument("--written", default="otsu",
                    help="Which rule's labels are WRITTEN: otsu, noise, or a fixed number such as 2.0. "
-                        "Also: epipolar, hybrid. All rules are reported.")
+                        "Also: epipolar, hybrid, parallax. All rules are reported.")
+    p.add_argument("--parallax-px", type=float, default=1.0,
+                   help="parallax rule: use the epipolar check only when the camera translation moves the "
+                        "background by more than this many pixels (after removing rotation).")
     p.add_argument("--min-threshold", type=float, default=1.0,
                    help="Per-frame thresholds are never below this many pixels.")
     p.add_argument("--min-area", type=float, default=0.01, help="Smallest blob kept (fraction of image).")
@@ -363,6 +394,8 @@ def main():
     labels_by_seq = {}
     agree_shares = {}            # sequence -> list of RANSAC agreement shares
     used_thresholds = {}         # sequence -> per-frame thresholds that were used
+    parallax_values = {}         # sequence -> per-frame translation parallax (pixels)
+    epipolar_chosen = {}         # sequence -> frames where the parallax rule chose epipolar
     examples = []
     cache = {}
     n_done = 0
@@ -444,6 +477,12 @@ def main():
             cell_spread = 1.4826 * float(np.median(cell_distance)) if len(cell_distance) else 1.0
             epipolar_noise = max(args.min_threshold, 4.0 * cell_spread)
 
+            # parallax: motion left after removing the camera rotation (pixels)
+            parallax = translation_parallax(E, cell_start, cell_end, cell_inliers, float(K[0, 0]))
+        else:
+            parallax = 0.0
+        parallax_values.setdefault(sequence, []).append(parallax)
+
         # Step 10: one label per rule
         rules = {f"fixed {thr:.1f} px": (difference, thr) for thr in THRESHOLDS}
         rules["per-frame otsu"] = (difference, otsu)
@@ -456,8 +495,18 @@ def main():
                 rules["hybrid noise"] = (difference, noise)
             else:
                 rules["hybrid noise"] = (epipolar, epipolar_noise)
+            # parallax rule: epipolar only when the camera translation causes real parallax
+            if parallax > args.parallax_px:
+                rules["parallax noise"] = (epipolar, epipolar_noise)
+                rules["parallax 2.0 px"] = (epipolar, max(2.0, epipolar_noise))
+                epipolar_chosen[sequence] = epipolar_chosen.get(sequence, 0) + 1
+            else:
+                rules["parallax noise"] = (difference, noise)
+                rules["parallax 2.0 px"] = (difference, noise)
         else:
             rules["hybrid noise"] = (difference, noise)
+            rules["parallax noise"] = (difference, noise)
+            rules["parallax 2.0 px"] = (difference, noise)
         frame_labels = {}
         for name, (difference_map, threshold) in rules.items():
             moving = (difference_map > threshold) & has_events
@@ -470,7 +519,7 @@ def main():
         # Step 11: keep the label of the --written rule
         if args.written in ("otsu", "noise"):
             chosen = frame_labels[f"per-frame {args.written}"]
-        elif args.written in ("epipolar", "hybrid"):
+        elif args.written in ("epipolar", "hybrid", "parallax"):
             chosen = frame_labels.get(f"{args.written} noise", frame_labels["per-frame noise"])
         else:
             threshold = float(args.written)
@@ -498,7 +547,8 @@ def main():
     print("=" * 100)
     rule_names = [f"fixed {thr:.1f} px" for thr in THRESHOLDS] + ["per-frame otsu", "per-frame noise",
                                                                   "epipolar 1.0 px", "epipolar 2.0 px",
-                                                                  "epipolar noise", "hybrid noise"]
+                                                                  "epipolar noise", "hybrid noise",
+                                                                  "parallax noise", "parallax 2.0 px"]
     report = {}
     for sequence in list(args.sequence) + ["ALL"]:
         if sequence == "ALL":
@@ -511,6 +561,10 @@ def main():
             noise_median = float(np.median(used["noise"])) if used["noise"] else float("nan")
             print(f"--- {sequence}   (cells agreeing with background: {median_share:.2f} | "
                   f"median per-frame threshold: otsu {otsu_median:.2f} px, noise {noise_median:.2f} px) ---")
+            values = parallax_values.get(sequence, [])
+            if values:
+                print(f"    translation parallax: median {np.median(values):.2f} px | parallax rule chose "
+                      f"epipolar in {epipolar_chosen.get(sequence, 0)}/{len(values)} frames")
         for name in rule_names:
             pooled = scores.get((sequence, name))
             if pooled is None:
