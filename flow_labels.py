@@ -33,6 +33,17 @@ How (per labelled frame i)
    12 Oct small test: the planar background model (8 numbers, exact motion
    of a slanted flat wall) beat the affine one on scene14_01 (0.37 vs 0.20),
    so planar is now the default.
+5. Epipolar check (added 12 Oct after the 8-sequence run): when the camera
+   moves sideways through a 3D room, near and far surfaces move differently
+   (parallax), so ONE plane cannot describe the background and walls get
+   marked as moving (scene14_00: precision 0.09). Every STATIC point, at any
+   depth, must still move along its "epipolar line", which depends only on
+   the camera's own motion. The camera motion (essential matrix) is fitted
+   with RANSAC to the cell flows using the camera calibration; a pixel is
+   moving if it is far from its epipolar line. No depth is needed.
+   "hybrid" = planar when most cells agree with one plane (>= 0.9), epipolar
+   otherwise (with very little camera translation the epipolar fit is
+   unreliable, and one plane is then enough).
 
 The true masks are used ONLY to score the labels.
 Needs Internet ON in Kaggle the first time (downloads RAFT weights, ~20 MB).
@@ -246,6 +257,55 @@ def otsu_threshold(values, top=10.0, bins=256):
     return float(edges[int(np.argmax(spread)) + 1])
 
 
+def to_normalised(points, K, dist):
+    """Pixel positions (N, 2) -> undistorted normalised camera coordinates (N, 2)."""
+    import cv2
+    points = np.asarray(points, np.float64).reshape(-1, 1, 2)
+    return cv2.undistortPoints(points, K, dist).reshape(-1, 2)
+
+
+def fit_essential(xs, ys, us, vs, K, dist, inlier_px):
+    """
+    Camera motion (essential matrix) from the cell flows, with RANSAC.
+    Returns (E 3x3, inlier mask per cell) or (None, None).
+    """
+    import cv2
+    # Step 1: where each cell centre was, and where it moved to
+    start = to_normalised(np.stack([xs, ys], 1), K, dist)
+    end = to_normalised(np.stack([xs + us, ys + vs], 1), K, dist)
+
+    # Step 2: RANSAC fit; the threshold is converted from pixels to normalised units
+    focal = float(K[0, 0])
+    E, mask = cv2.findEssentialMat(start, end, focal=1.0, pp=(0.0, 0.0), method=cv2.RANSAC,
+                                   prob=0.999, threshold=inlier_px / focal)
+    if E is None or E.shape[0] < 3:
+        return None, None
+    return E[:3, :3], mask.ravel().astype(bool)
+
+
+def epipolar_distance(E, start, end, focal):
+    """
+    Distance (pixels) of each moved point from its epipolar line
+    (first-order "Sampson" distance). start, end: normalised (N, 2).
+    """
+    # Step 1: add a 1 to every point (homogeneous coordinates)
+    ones = np.ones((len(start), 1))
+    p1 = np.hstack([start, ones])
+    p2 = np.hstack([end, ones])
+
+    # Step 2: epipolar lines in both pictures
+    line_2 = p1 @ E.T            # E p1
+    line_1 = p2 @ E              # E^T p2
+
+    # Step 3: how badly each pair breaks the rule p2^T E p1 = 0, scaled to a distance
+    error = np.sum(p2 * line_2, axis=1)
+    scale = line_2[:, 0] ** 2 + line_2[:, 1] ** 2 + line_1[:, 0] ** 2 + line_1[:, 1] ** 2
+    distance = np.abs(error) / np.sqrt(np.maximum(scale, 1e-18))
+
+    # Step 4: back to pixels
+    return distance * focal
+
+
 def model_flow(theta, H, W, model):
     """Motion model -> flow (H, W, 2) for every pixel."""
     v, u = np.mgrid[0:H, 0:W]
@@ -270,7 +330,7 @@ def main():
     p.add_argument("--inlier-px", type=float, default=1.0, help="RANSAC: cell agrees within this many pixels.")
     p.add_argument("--written", default="otsu",
                    help="Which rule's labels are WRITTEN: otsu, noise, or a fixed number such as 2.0. "
-                        "All rules are reported.")
+                        "Also: epipolar, hybrid. All rules are reported.")
     p.add_argument("--min-threshold", type=float, default=1.0,
                    help="Per-frame thresholds are never below this many pixels.")
     p.add_argument("--min-area", type=float, default=0.01, help="Smallest blob kept (fraction of image).")
@@ -362,13 +422,45 @@ def main():
         used_thresholds[sequence]["otsu"].append(otsu)
         used_thresholds[sequence]["noise"].append(noise)
 
+        # Step 9b: epipolar check (handles parallax; needs no depth)
+        K = np.asarray(a.camera_intrinsics, np.float64)
+        dist = np.asarray(a.camera_distortion, np.float64)
+        epipolar = None
+        epipolar_noise = None
+        E, cell_inliers = fit_essential(xs, ys, us, vs, K, dist, args.inlier_px)
+        if E is not None:
+            # distance of every event pixel from its epipolar line
+            rows_px, cols_px = np.nonzero(has_events)
+            start = to_normalised(np.stack([cols_px, rows_px], 1), K, dist)
+            moved = np.stack([cols_px + flow[rows_px, cols_px, 0], rows_px + flow[rows_px, cols_px, 1]], 1)
+            end = to_normalised(moved, K, dist)
+            epipolar = np.zeros((H, W))
+            epipolar[rows_px, cols_px] = epipolar_distance(E, start, end, float(K[0, 0]))
+
+            # noise rule: 4 x robust spread of the agreeing cells' own distances
+            cell_start = to_normalised(np.stack([xs, ys], 1), K, dist)
+            cell_end = to_normalised(np.stack([xs + us, ys + vs], 1), K, dist)
+            cell_distance = epipolar_distance(E, cell_start, cell_end, float(K[0, 0]))[cell_inliers]
+            cell_spread = 1.4826 * float(np.median(cell_distance)) if len(cell_distance) else 1.0
+            epipolar_noise = max(args.min_threshold, 4.0 * cell_spread)
+
         # Step 10: one label per rule
-        rules = {f"fixed {thr:.1f} px": thr for thr in THRESHOLDS}
-        rules["per-frame otsu"] = otsu
-        rules["per-frame noise"] = noise
+        rules = {f"fixed {thr:.1f} px": (difference, thr) for thr in THRESHOLDS}
+        rules["per-frame otsu"] = (difference, otsu)
+        rules["per-frame noise"] = (difference, noise)
+        if epipolar is not None:
+            rules["epipolar 1.0 px"] = (epipolar, 1.0)
+            rules["epipolar 2.0 px"] = (epipolar, 2.0)
+            rules["epipolar noise"] = (epipolar, epipolar_noise)
+            if agree >= 0.9:
+                rules["hybrid noise"] = (difference, noise)
+            else:
+                rules["hybrid noise"] = (epipolar, epipolar_noise)
+        else:
+            rules["hybrid noise"] = (difference, noise)
         frame_labels = {}
-        for name, threshold in rules.items():
-            moving = (difference > threshold) & has_events
+        for name, (difference_map, threshold) in rules.items():
+            moving = (difference_map > threshold) & has_events
             frame_labels[name] = fill_blobs(moving, close_radius=5, min_area_fraction=args.min_area)
         if gt is not None:
             for name, label in frame_labels.items():
@@ -378,6 +470,8 @@ def main():
         # Step 11: keep the label of the --written rule
         if args.written in ("otsu", "noise"):
             chosen = frame_labels[f"per-frame {args.written}"]
+        elif args.written in ("epipolar", "hybrid"):
+            chosen = frame_labels.get(f"{args.written} noise", frame_labels["per-frame noise"])
         else:
             threshold = float(args.written)
             chosen = fill_blobs((difference > threshold) & has_events, close_radius=5,
@@ -402,7 +496,9 @@ def main():
     print(f"SMALL TEST: dense-flow labels against the TRUE masks (report only) | background model: {args.background_model}")
     print("Reference, B1 (one motion + dither) on the same sequences: 14_01 0.278 | 15_00 0.003 | 6_03 0.016")
     print("=" * 100)
-    rule_names = [f"fixed {thr:.1f} px" for thr in THRESHOLDS] + ["per-frame otsu", "per-frame noise"]
+    rule_names = [f"fixed {thr:.1f} px" for thr in THRESHOLDS] + ["per-frame otsu", "per-frame noise",
+                                                                  "epipolar 1.0 px", "epipolar 2.0 px",
+                                                                  "epipolar noise", "hybrid noise"]
     report = {}
     for sequence in list(args.sequence) + ["ALL"]:
         if sequence == "ALL":
