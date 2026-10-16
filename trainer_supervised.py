@@ -55,12 +55,15 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.models.supervised_model import SupervisedMotionSegmenter, SupervisedLoss, build_targets
 from src.utils.metrics import SegmentationMetrics
+from src.models.supervised_model.targets import build_gt_mask
+from src.data.input_tools import normalize_voxels, random_flip_and_zoom, EventPixelIoU
 
 logger = logging.getLogger(__name__)
 
 # Fields that change the network's shape; on evaluation/resume they are
 # always taken from the checkpoint, never from the command line.
-ARCHITECTURE_FIELDS = ("num_bins", "history_offsets", "use_imu", "depth_weight", "pose_weight")
+ARCHITECTURE_FIELDS = ("num_bins", "history_offsets", "use_imu", "depth_weight", "pose_weight",
+                       "normalize_voxels")
 
 
 @dataclass
@@ -81,6 +84,11 @@ class TrainConfigSupervised:
     balance_dynamic_batches: bool = True
     min_dynamic_per_batch: int = 1
     event_dropout: float = 0.0
+    # ---- Step 2 diagnosis (October 2026) ----
+    normalize_voxels: bool = False   # mean 0 / spread 1 on non-empty cells (E-RAFT rule)
+    augment: bool = False            # random left-right mirror + zoom during training
+    zoom_min: float = 0.8            # 0.8 = objects look smaller
+    zoom_max: float = 1.5            # 1.5 = objects look 1.5x bigger
     # ---- labels ----
     label_source: str = "ground_truth"   # ground_truth | pseudo
     pseudo_label_dir: str | None = None
@@ -194,6 +202,22 @@ class TrainerSupervised:
         ).to(self.device)
         n_params = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Model parameters: {n_params:,} ({n_params / 1e6:.2f}M)")
+
+        # ---- Step 2 diagnosis settings ----
+        # Mirroring changes the meaning of the rotation sensor and of the
+        # camera-motion / depth helper targets, so augmentation is only
+        # allowed when those are switched off.
+        if cfg.augment and cfg.use_imu:
+            raise ValueError("--augment needs --no-imu (mirroring would make the "
+                             "rotation-sensor input wrong).")
+        if cfg.augment and (cfg.depth_weight > 0 or cfg.pose_weight > 0):
+            raise ValueError("--augment needs --depth-weight 0 --pose-weight 0.")
+        logger.info(
+            f"Voxel normalisation: {'on' if cfg.normalize_voxels else 'off'}"
+            f" | augmentation (mirror + zoom {cfg.zoom_min}-{cfg.zoom_max}): "
+            f"{'on' if cfg.augment else 'off'}"
+            f" | event dropout: {cfg.event_dropout}"
+        )
         logger.info(
             f"Inputs: {len(cfg.history_offsets)} frames {tuple(cfg.history_offsets)} x {cfg.num_bins} bins"
             f" | inertial: {'on' if cfg.use_imu else 'off'}"
@@ -427,6 +451,9 @@ class TrainerSupervised:
     def _forward(self, model, raw_batch, train: bool):
         voxel_batch = self.transform(raw_batch).to(self.device)
         voxels = torch.stack([f.voxel_grid for f in voxel_batch.frames], dim=1).float()
+        # Step 2 diagnosis: same number range in every scene (train AND evaluation)
+        if self.cfg.normalize_voxels:
+            voxels = normalize_voxels(voxels)
         if train and self.cfg.event_dropout > 0:
             B, _, _, H, W = voxels.shape
             keep = (torch.rand(B, 1, 1, H, W, device=voxels.device) >= self.cfg.event_dropout)
@@ -435,6 +462,58 @@ class TrainerSupervised:
         with self._autocast():
             outputs = model(voxels, imu_frames)
         return outputs, voxels
+
+    def _forward_augmented(self, model, raw_batch):
+        """
+        Training step input WITH mirror + zoom augmentation.
+        The labels are built first, then the SAME random change is applied
+        to the event pictures and the labels, then the network runs.
+        Returns (outputs, voxels, targets).
+        """
+        # Step 1: event pictures, shape (B, T, C, H, W), e.g. (4, 3, 5, 480, 640)
+        voxel_batch = self.transform(raw_batch).to(self.device)
+        voxels = torch.stack([f.voxel_grid for f in voxel_batch.frames], dim=1).float()
+
+        # Step 2: optional normalisation (before the geometric change)
+        if self.cfg.normalize_voxels:
+            voxels = normalize_voxels(voxels)
+
+        # Step 3: optional event dropout (switch off random pixels)
+        if self.cfg.event_dropout > 0:
+            B, _, _, H, W = voxels.shape
+            keep = (torch.rand(B, 1, 1, H, W, device=voxels.device) >= self.cfg.event_dropout)
+            voxels = voxels * keep
+
+        # Step 4: labels at the picture size (no depth / camera-motion targets)
+        height = voxels.shape[-2]
+        width = voxels.shape[-1]
+        targets = build_targets(
+            raw_batch,
+            mask_hw=(height, width),
+            depth_hw=None,
+            need_pose=False,
+            pseudo_store=self.pseudo_store,
+            pseudo_ignore_band=self.cfg.pseudo_ignore_band,
+        )
+
+        # Step 5: the same random mirror + zoom for pictures and labels
+        old_weight = targets.get("mask_weight")
+        voxels, new_label, new_weight = random_flip_and_zoom(
+            voxels, targets["gt_mask"], old_weight,
+            zoom_min=self.cfg.zoom_min, zoom_max=self.cfg.zoom_max,
+        )
+        targets["gt_mask"] = new_label
+        targets["mask_weight"] = new_weight
+
+        # Step 6: run the network (no rotation-sensor input in this mode)
+        with self._autocast():
+            outputs = model(voxels, None)
+
+        # Step 7: safety check — the prediction must match the label size
+        if tuple(outputs["mask"].shape[-2:]) != (height, width):
+            raise RuntimeError("Augmentation assumes the predicted mask has the same "
+                               "size as the input events.")
+        return outputs, voxels, targets
 
     def _targets(self, raw_batch, outputs):
         depth_hw = tuple(outputs["depth_log"].shape[-2:]) if outputs.get("depth_log") is not None else None
@@ -465,8 +544,11 @@ class TrainerSupervised:
             running, n_running = 0.0, 0
 
             for batch_idx, raw_batch in enumerate(self.train_loader):
-                outputs, voxels = self._forward(self.model, raw_batch, train=True)
-                targets = self._targets(raw_batch, outputs)
+                if cfg.augment:
+                    outputs, voxels, targets = self._forward_augmented(self.model, raw_batch)
+                else:
+                    outputs, voxels = self._forward(self.model, raw_batch, train=True)
+                    targets = self._targets(raw_batch, outputs)
                 if not targets["mask_valid"].any():
                     continue
 
@@ -552,6 +634,8 @@ class TrainerSupervised:
             f"IoU@0.5={r['iou_at_0.5']:.4f} | F1={r['best_f1']:.4f} | "
             f"P={r['best_precision']:.3f} R={r['best_recall']:.3f} | "
             f"pred_dr={r['pred_dynamic_ratio']:.4f} gt_dr={r['gt_dynamic_ratio']:.4f} | "
+            f"event-pixel IoU@0.5 pooled={r['event_iou_pooled']:.4f} "
+            f"per-frame={r['event_iou_mean_per_frame']:.4f} | "
             f"best {self.best_metric:.4f} @ epoch {self.best_epoch}"
             + ("  << NEW BEST" if improved else "")
         )
@@ -574,13 +658,28 @@ class TrainerSupervised:
         thresholds = sorted(set(self.cfg.eval_thresholds) | {0.5})
         overall = SegmentationMetrics(thresholds)
         by_sequence: dict[str, SegmentationMetrics] = {}
+        # Published-style score: event pixels only, frames with a moving object only
+        event_overall = EventPixelIoU(threshold=0.5)
+        event_by_sequence: dict[str, EventPixelIoU] = {}
 
         for raw_batch in loader:
-            outputs, _ = self._forward(model, raw_batch, train=False)
+            outputs, voxels = self._forward(model, raw_batch, train=False)
             probs = torch.sigmoid(outputs["mask"].float())
             last = raw_batch.frames[-1]
             masks, motions = list(last.mask), list(last.frame_motion)
             overall.update(probs, masks, frame_motions=motions)
+
+            # ---- event-pixel score ----
+            # Step a: true moving-object mask at the prediction size (1 = moving)
+            pred_hw = tuple(probs.shape[-2:])
+            true_mask, _ = build_gt_mask(masks, motions, hw=pred_hw)
+            # Step b: pixels of the LAST frame (the predicted one) that have events
+            last_frame_voxels = voxels[:, -1]                      # (B, C, H, W)
+            event_pixels = last_frame_voxels.abs().sum(dim=1, keepdim=True) > 0
+            if tuple(event_pixels.shape[-2:]) != pred_hw:
+                event_pixels = F.interpolate(event_pixels.float(), size=pred_hw, mode="nearest") > 0
+            # Step c: add this batch to the counters
+            event_overall.update(probs, true_mask, event_pixels)
 
             if per_sequence:
                 names = list(getattr(last, "sequence_names", ["all"] * len(masks)))
@@ -588,9 +687,12 @@ class TrainerSupervised:
                     idx = [i for i, n in enumerate(names) if n == name]
                     m = by_sequence.setdefault(name, SegmentationMetrics(thresholds))
                     m.update(probs[idx], [masks[i] for i in idx], frame_motions=[motions[i] for i in idx])
+                    e = event_by_sequence.setdefault(name, EventPixelIoU(threshold=0.5))
+                    e.update(probs[idx], true_mask[idx], event_pixels[idx])
 
         r = overall.compute()
         r["iou_at_0.5"] = r["per_threshold"]["thr_0.50"]["iou"]
+        r.update(event_overall.compute())
         if per_sequence:
             r["per_sequence"] = {}
             for name, m in sorted(by_sequence.items()):
@@ -599,6 +701,7 @@ class TrainerSupervised:
                     "best_iou": s["best_iou"], "best_threshold": s["best_threshold"],
                     "iou_at_0.5": s["per_threshold"]["thr_0.50"]["iou"],
                     "gt_dynamic_ratio": s["gt_dynamic_ratio"],
+                    **event_by_sequence[name].compute(),
                 }
         if was_training:
             model.train()
@@ -622,6 +725,9 @@ class TrainerSupervised:
             "best_iou": r["best_iou"], "best_threshold": r["best_threshold"],
             "iou_at_0.5": r["iou_at_0.5"], "f1": r["best_f1"],
             "precision": r["best_precision"], "recall": r["best_recall"],
+            "event_iou_pooled": r["event_iou_pooled"],
+            "event_iou_mean_per_frame": r["event_iou_mean_per_frame"],
+            "event_frames_scored": r["event_frames_scored"],
             "per_threshold": r["per_threshold"],
             "per_sequence": r.get("per_sequence", {}),
         }
@@ -665,8 +771,12 @@ class TrainerSupervised:
             logger.info(f"    IoU at threshold 0.50        : {L['iou_at_0.5']:.4f}")
             logger.info(f"    IoU at best threshold ({L['best_threshold']:.2f}) : {L['best_iou']:.4f}")
             logger.info(f"    F1 / precision / recall      : {L['f1']:.4f} / {L['precision']:.3f} / {L['recall']:.3f}")
+            logger.info(f"    Event-pixel IoU@0.5 (published style, frames with a moving object):")
+            logger.info(f"      pooled {L['event_iou_pooled']:.4f} | mean per frame "
+                        f"{L['event_iou_mean_per_frame']:.4f} | frames scored {L['event_frames_scored']}")
             for seq, s in L["per_sequence"].items():
-                logger.info(f"    {seq:40s} IoU@0.5={s['iou_at_0.5']:.4f}  best IoU={s['best_iou']:.4f}")
+                logger.info(f"    {seq:40s} IoU@0.5={s['iou_at_0.5']:.4f}  best IoU={s['best_iou']:.4f}"
+                            f"  event-pixel per-frame={s['event_iou_mean_per_frame']:.4f}")
         if "best" in results:
             B = results["best"]
             note = "" if self.eval_tag not in ("train_overfit", "train_fallback") else \
@@ -701,7 +811,7 @@ class TrainerSupervised:
     @torch.no_grad()
     def _log_images(self, gs, outputs, targets, voxels):
         probs = outputs["mask_probs"].float().cpu()
-        gt = targets["gt_mask"].float()
+        gt = targets["gt_mask"].float().cpu()   # .cpu(): augmented labels live on the GPU
         events = voxels[:, -1].abs().sum(dim=1, keepdim=True).float().cpu()
         n = min(self.cfg.viz_max_samples, probs.shape[0])
         for i in range(n):

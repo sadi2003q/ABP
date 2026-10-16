@@ -69,6 +69,16 @@ def main():
     g.add_argument("--event-dropout", type=float, default=0.0,
                    help="Fraction of pixels whose events are dropped during training "
                         "(augmentation). 0.1 recommended for full-dataset runs.")
+    g.add_argument("--normalize-voxels", action="store_true",
+                   help="Rescale each event picture so its non-empty cells have mean 0 "
+                        "and spread 1 (E-RAFT rule). Used in training and evaluation.")
+    g.add_argument("--augment", action="store_true",
+                   help="Training only: random left-right mirror + zoom of events and "
+                        "labels together. Needs --no-imu --depth-weight 0 --pose-weight 0.")
+    g.add_argument("--zoom-min", type=float, default=0.8,
+                   help="Smallest zoom for --augment (0.8 = objects look smaller).")
+    g.add_argument("--zoom-max", type=float, default=1.5,
+                   help="Largest zoom for --augment (1.5 = objects look 1.5x bigger).")
 
     g = p.add_argument_group("labels")
     g.add_argument("--label-source", type=str, default="ground_truth", choices=["ground_truth", "pseudo"],
@@ -153,6 +163,10 @@ def main():
         balance_dynamic_batches=not args.no_balance,
         min_dynamic_per_batch=args.min_dynamic_per_batch,
         event_dropout=args.event_dropout,
+        normalize_voxels=args.normalize_voxels,
+        augment=args.augment,
+        zoom_min=args.zoom_min,
+        zoom_max=args.zoom_max,
         label_source=args.label_source,
         pseudo_label_dir=args.pseudo_label_dir,
         pseudo_ignore_band=args.pseudo_ignore_band,
