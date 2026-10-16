@@ -138,6 +138,69 @@ def event_picture(xy, H, W):
 
 
 # ----------------------------------------------------------------------
+# 1b. Published-style score (event pixels only)
+# ----------------------------------------------------------------------
+
+def event_counts(label, gt, event_pixels):
+    """
+    Overlap counted ONLY on pixels that have events in this frame.
+    label, gt, event_pixels : (H, W) True/False maps
+    Returns (tp, fp, fn), e.g. (950, 120, 300).
+    """
+    # Step 1: keep only event pixels
+    label_on_events = label & event_pixels
+    gt_on_events = gt & event_pixels
+
+    # Step 2: count the three cases
+    tp = int(np.sum(label_on_events & gt_on_events))      # moving, and labelled moving
+    fp = int(np.sum(label_on_events & ~gt_on_events))     # labelled moving, but not moving
+    fn = int(np.sum(~label_on_events & gt_on_events))     # moving, but missed
+    return tp, fp, fn
+
+
+class EventScore:
+    """
+    Published EVIMO2 style: only frames with a moving object, only event pixels.
+    Keeps both the pooled IoU and the IoU of every frame (for the mean per frame).
+    """
+
+    def __init__(self):
+        # Step 1: pooled counters
+        self.tp = 0
+        self.fp = 0
+        self.fn = 0
+        # Step 2: one IoU per scored frame
+        self.frame_ious = []
+
+    def add(self, tp, fp, fn):
+        # Step 1: skip frames with nothing to compare
+        # (e.g. the moving object made no events in this frame)
+        union = tp + fp + fn
+        if union == 0:
+            return
+        # Step 2: add to the pooled counters
+        self.tp += tp
+        self.fp += fp
+        self.fn += fn
+        # Step 3: this frame's own IoU, e.g. 950 / 1370 = 0.69
+        self.frame_ious.append(tp / union)
+
+    def pooled(self):
+        union = self.tp + self.fp + self.fn
+        if union == 0:
+            return 0.0
+        return self.tp / union
+
+    def mean_per_frame(self):
+        if len(self.frame_ious) == 0:
+            return 0.0
+        return float(np.mean(self.frame_ious))
+
+    def frames(self):
+        return len(self.frame_ious)
+
+
+# ----------------------------------------------------------------------
 # 2. Dense flow with RAFT
 # ----------------------------------------------------------------------
 
@@ -403,6 +466,7 @@ def main():
     print(f"RAFT ({args.raft}) loaded", flush=True)
 
     scores = {}                  # (sequence, threshold) -> Pooled
+    event_scores = {}            # (sequence, rule) -> EventScore (published style)
     labels_by_seq = {}
     agree_shares = {}            # sequence -> list of RANSAC agreement shares
     used_thresholds = {}         # sequence -> per-frame thresholds that were used
@@ -529,6 +593,20 @@ def main():
                 scores.setdefault((sequence, name), Pooled()).update(label, gt)
                 scores.setdefault(("ALL", name), Pooled()).update(label, gt)
 
+        # Step 10b: published-style score (frames with a moving object only)
+        planar_counts = None
+        epipolar_counts = None
+        event_pixels = None
+        if gt is not None and gt.any():
+            # pixels with at least one event in frame i itself (no dilation)
+            events_now = events_of_frames(ds, refs, i, i + 1, cache)
+            _, count_now = event_picture(events_now, H, W)
+            event_pixels = count_now > 0
+            for name, label in frame_labels.items():
+                counts = event_counts(label, gt, event_pixels)
+                event_scores.setdefault((sequence, name), EventScore()).add(*counts)
+                event_scores.setdefault(("ALL", name), EventScore()).add(*counts)
+
         # Step 11: keep the label of the --written rule
         if args.written in ("otsu", "noise"):
             chosen = frame_labels[f"per-frame {args.written}"]
@@ -546,10 +624,15 @@ def main():
             # same as the "parallax 2.0 px" rule: threshold at least 2 px, or the noise level if higher
             epipolar_label = fill_blobs((epipolar > max(2.0, epipolar_noise)) & has_events,
                                         close_radius=5, min_area_fraction=args.min_area)
+        # published-style counts of the two candidates (the smoothed rule picks one later)
+        if event_pixels is not None:
+            planar_counts = event_counts(frame_labels["per-frame noise"], gt, event_pixels)
+            epipolar_counts = event_counts(epipolar_label, gt, event_pixels)
         smoothing_store.append({
             "sensor": a.sensor, "sequence": sequence, "frame": int(a.local_frame_index),
             "parallax": parallax, "planar": frame_labels["per-frame noise"],
             "epipolar": epipolar_label, "gt": gt,
+            "planar_counts": planar_counts, "epipolar_counts": epipolar_counts,
         })
 
         # Step 12: frames for the check picture
@@ -575,9 +658,16 @@ def main():
         # Step 13b: epipolar when the camera clearly moves through the scene, planar otherwise
         if typical_parallax > args.parallax_px:
             label = entry["epipolar"]
+            chosen_counts = entry["epipolar_counts"]
             smoothed_epipolar[entry["sequence"]] = smoothed_epipolar.get(entry["sequence"], 0) + 1
         else:
             label = entry["planar"]
+            chosen_counts = entry["planar_counts"]
+
+        # Step 13b2: published-style score of the smoothed rule
+        if chosen_counts is not None:
+            event_scores.setdefault((entry["sequence"], "smoothed"), EventScore()).add(*chosen_counts)
+            event_scores.setdefault(("ALL", "smoothed"), EventScore()).add(*chosen_counts)
         key = (entry["sensor"], entry["sequence"])
         smoothed_by_seq.setdefault(key, {})[entry["frame"]] = label
         planar_by_seq.setdefault(key, {})[entry["frame"]] = entry["planar"]
@@ -631,6 +721,38 @@ def main():
             print(f"  {name:<17} IoU {pooled.iou():.3f}   precision {precision:.3f}   "
                   f"recall {recall:.3f}   false-blob frames {pooled.static_frames_with_fp}/{pooled.static_frames}")
             report[f"{sequence} | {name}"] = {"iou": pooled.iou(), "precision": precision, "recall": recall}
+
+    # Step 14b: published-style table (event pixels, frames with a moving object)
+    print("\n" + "=" * 100)
+    print("PUBLISHED-STYLE SCORE: IoU on EVENT PIXELS of frame i, only frames with a moving object")
+    print("('smoothed' is the FROZEN method; the other rules are for reference only, never for choosing)")
+    print("=" * 100)
+    for sequence in list(args.sequence) + ["ALL"]:
+        print(f"--- {sequence} ---")
+        for name in rule_names:
+            score = event_scores.get((sequence, name))
+            if score is None:
+                continue
+            print(f"  {name:<17} mean per frame {score.mean_per_frame():.3f}   "
+                  f"pooled {score.pooled():.3f}   frames {score.frames()}")
+            report[f"{sequence} | {name} | event"] = {
+                "mean_per_frame": score.mean_per_frame(),
+                "pooled": score.pooled(),
+                "frames": score.frames(),
+            }
+
+    # Step 14c: average over sequences of the frozen method (how papers report a table average)
+    per_sequence_means = []
+    for sequence in args.sequence:
+        score = event_scores.get((sequence, "smoothed"))
+        if score is not None and score.frames() > 0:
+            per_sequence_means.append(score.mean_per_frame())
+    if per_sequence_means:
+        average = float(np.mean(per_sequence_means))
+        print(f"\nFROZEN method ('smoothed'), average over {len(per_sequence_means)} sequences "
+              f"of the mean per-frame event-pixel IoU: {average:.3f}")
+        report["average over sequences | smoothed | event"] = average
+
     with open(out / "flow_report.json", "w") as f:
         json.dump(report, f, indent=2)
 
